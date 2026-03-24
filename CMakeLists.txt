@@ -480,6 +480,24 @@ if(WOLFPKCS11_MLDSA)
 endif()
 
 
+# ML-KEM
+add_option("WOLFPKCS11_MLKEM"
+    "Enable wolfPKCS11 ML-KEM support (default: disabled)"
+    "no" "yes;no"
+)
+
+if(NOT WOLFPKCS11_SHA3)
+    override_cache(WOLFPKCS11_MLKEM "no")
+endif()
+
+if(WOLFPKCS11_MLKEM)
+    if(NOT WOLFPKCS11_PKCS11_V3_2)
+        message(FATAL_ERROR "ML-KEM requires PKCS#11 Version 3.2 support (enable WOLFPKCS11_PKCS11_V3_2)")
+    endif()
+    list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_MLKEM")
+endif()
+
+
 # If wolfpkcs11/options.h exists, delete it to avoid
 # a mixup with build/wolfpkcs11/options.h.
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/wolfpkcs11/options.h")

@@ -118,6 +118,9 @@ extern "C" {
 #define CKF_EC_UNCOMPRESS                     0x01000000UL
 #define CKF_EC_COMPRESS                       0x02000000UL
 
+#define CKF_ENCAPSULATE                       0x10000000UL
+#define CKF_DECAPSULATE                       0x20000000UL
+
 #define CKF_LIBRARY_CANT_CREATE_OS_THREADS    0x00000001UL
 #define CKF_OS_LOCKING_OK                     0x00000002UL
 
@@ -173,6 +176,7 @@ extern "C" {
 #define CKK_AES                               0x0000001FUL
 #define CKK_DES3                              0x00000015UL /* not supported */
 #define CKK_HKDF                              0x00000042UL
+#define CKK_ML_KEM                            0x00000049UL
 #define CKK_ML_DSA                            0x0000004AUL
 
 #ifdef WOLFPKCS11_NSS
@@ -255,6 +259,9 @@ extern "C" {
 /* new post-quantum (general) */
 #define CKA_PARAMETER_SET                     0x0000061DUL
 #define CKA_SEED                              0x00000637UL
+/* KEM */
+#define CKA_ENCAPSULATE                       0x00000633UL
+#define CKA_DECAPSULATE                       0x00000634UL
 
 #ifdef WOLFPKCS11_NSS
 #define CKA_NSS_EMAIL                         (CKA_NSS + 2)
@@ -353,6 +360,8 @@ extern "C" {
 #define CKM_HKDF_DERIVE                       0x0000402AUL
 #define CKM_HKDF_DATA                         0x0000402BUL
 #define CKM_HKDF_KEY_GEN                      0x0000402CUL
+#define CKM_ML_KEM_KEY_PAIR_GEN               0x0000000FUL
+#define CKM_ML_KEM                            0x00000017UL
 #define CKM_ML_DSA_KEY_PAIR_GEN               0x0000001CUL
 #define CKM_ML_DSA                            0x0000001DUL
 #define CKM_HASH_ML_DSA                       0x0000001FUL
@@ -861,6 +870,12 @@ typedef CK_ULONG CK_ML_DSA_PARAMETER_SET_TYPE;
 #define CKP_ML_DSA_44          0x00000001UL
 #define CKP_ML_DSA_65          0x00000002UL
 #define CKP_ML_DSA_87          0x00000003UL
+
+/* ML-KEM values for CKA_PARAMETER_SET */
+typedef CK_ULONG CK_ML_KEM_PARAMETER_SET_TYPE;
+#define CKP_ML_KEM_512         0x00000001UL
+#define CKP_ML_KEM_768         0x00000002UL
+#define CKP_ML_KEM_1024        0x00000003UL
 
 
 /* Function list types. */
