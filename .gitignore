@@ -43,6 +43,9 @@ tests/rsa_session_persistence_test
 tests/debug_test
 tests/token_path_test
 tests/pkcs11v3test
+tests/aes_cbc_pad_padding_test
+tests/ecb_check_value_error_test
+tests/find_objects_null_template_test
 examples/add_aes_key
 examples/add_hmac_key
 examples/add_rsa_key
@@ -54,8 +57,10 @@ examples/obj_list
 examples/slot_info
 examples/token_info
 store/wp11*
+store/cbc_pad_padding_test
 store/debug
 store/empty_pin_test
+store/find_null_test
 store/object
 store/pkcs11mtt
 store/pkcs11test
