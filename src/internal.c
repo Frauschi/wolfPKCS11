@@ -356,7 +356,7 @@ typedef struct WP11_PssParams {
 typedef struct WP11_MldsaParams {
     enum wc_HashType preHashType;
     word32 hedgeType;
-    byte* ctx;
+    byte ctx[256];
     byte ctxSz;
 } WP11_MldsaParams;
 #endif
@@ -909,14 +909,6 @@ static void wp11_Session_Final(WP11_Session* session)
                                            session->params.oaep.label != NULL) {
         XFREE(session->params.oaep.label, NULL, DYNAMIC_TYPE_TMP_BUFFER);
         session->params.oaep.label = NULL;
-    }
-#endif
-#ifdef WOLFPKCS11_MLDSA
-    if ((session->mechanism == CKM_ML_DSA ||
-         session->mechanism == CKM_HASH_ML_DSA) &&
-                                            session->params.mldsa.ctx != NULL) {
-        XFREE(session->params.mldsa.ctx, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        session->params.mldsa.ctx = NULL;
     }
 #endif
 #ifndef NO_AES
@@ -7845,7 +7837,6 @@ int WP11_Session_SetMldsaParams(WP11_Session* session, CK_VOID_PTR params,
     int ret = 0;
     WP11_MldsaParams* mldsa = &session->params.mldsa;
 
-    XFREE(mldsa->ctx, NULL, DYNAMIC_TYPE_TMP_BUFFER);
     XMEMSET(mldsa, 0, sizeof(*mldsa));
 
     if (params != NULL) {
@@ -7860,18 +7851,11 @@ int WP11_Session_SetMldsaParams(WP11_Session* session, CK_VOID_PTR params,
                     ret = BAD_FUNC_ARG;
                 }
                 if (ret == 0) {
-                    mldsa->ctx = (byte*)XMALLOC(ctx->ulContextLen, NULL,
-                                                DYNAMIC_TYPE_TMP_BUFFER);
-                    if (mldsa->ctx == NULL)
-                        ret = MEMORY_E;
-                }
-                if (ret == 0) {
                     XMEMCPY(mldsa->ctx, ctx->pContext, ctx->ulContextLen);
                     mldsa->ctxSz = ctx->ulContextLen;
                 }
             }
             else {
-                mldsa->ctx = NULL;
                 mldsa->ctxSz = 0;
             }
 
@@ -7889,18 +7873,11 @@ int WP11_Session_SetMldsaParams(WP11_Session* session, CK_VOID_PTR params,
                     ret = BAD_FUNC_ARG;
                 }
                 if (ret == 0) {
-                    mldsa->ctx = (byte*)XMALLOC(ctx->ulContextLen, NULL,
-                                                DYNAMIC_TYPE_TMP_BUFFER);
-                    if (mldsa->ctx == NULL)
-                        ret = MEMORY_E;
-                }
-                if (ret == 0) {
                     XMEMCPY(mldsa->ctx, ctx->pContext, ctx->ulContextLen);
                     mldsa->ctxSz = ctx->ulContextLen;
                 }
             }
             else {
-                mldsa->ctx = NULL;
                 mldsa->ctxSz = 0;
             }
 
@@ -7917,7 +7894,6 @@ int WP11_Session_SetMldsaParams(WP11_Session* session, CK_VOID_PTR params,
     else {
         mldsa->preHashType = WC_HASH_TYPE_NONE;
         mldsa->hedgeType = CKH_HEDGE_PREFERRED;
-        mldsa->ctx = NULL;
         mldsa->ctxSz = 0;
     }
 
@@ -12774,8 +12750,6 @@ int WP11_Mldsa_Sign(unsigned char* data, word32 dataLen, unsigned char* sig,
         Rng_Free(&rng);
     }
 
-    XFREE(params->ctx, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-    params->ctx = NULL;
     params->ctxSz = 0;
 
     if (priv->onToken)
@@ -12824,8 +12798,6 @@ int WP11_Mldsa_Verify(unsigned char* sig, word32 sigLen, unsigned char* data,
         }
     }
 
-    XFREE(params->ctx, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-    params->ctx = NULL;
     params->ctxSz = 0;
 
     if (pub->onToken)
