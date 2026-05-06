@@ -369,6 +369,12 @@ static CK_MECHANISM_TYPE mechanismList[] = {
     CKM_ML_DSA,
     CKM_HASH_ML_DSA,
 #endif
+#ifdef WOLFPKCS11_LMS
+    CKM_HSS,
+#  ifdef WOLFPKCS11_LMS_PRIVATE
+    CKM_HSS_KEY_PAIR_GEN,
+#  endif
+#endif
 #ifdef WOLFPKCS11_HKDF
     CKM_HKDF_DERIVE,
     CKM_HKDF_DATA,
@@ -639,6 +645,24 @@ static CK_MECHANISM_INFO mldsaMechInfo = {
     ML_DSA_LEVEL5_PUB_KEY_SIZE,
     CKF_SIGN | CKF_VERIFY
 };
+#endif
+#ifdef WOLFPKCS11_LMS
+/* HSS public-key sizes are small and parameter-dependent (RFC 8554). For
+ * mechanism advertising we report a wide envelope: smallest L1/H5 ≈ 60 bytes,
+ * largest L4/H25 ≈ 60 bytes (HSS pub is fixed-size for a given hash), so
+ * pick a coarse envelope that fits all parameter combos. */
+static CK_MECHANISM_INFO hssMechInfo = {
+    60, 60,
+    CKF_VERIFY
+#  ifdef WOLFPKCS11_LMS_PRIVATE
+    | CKF_SIGN
+#  endif
+};
+#  ifdef WOLFPKCS11_LMS_PRIVATE
+static CK_MECHANISM_INFO hssKgMechInfo = {
+    60, 60, CKF_GENERATE_KEY_PAIR
+};
+#  endif
 #endif
 #ifdef WOLFPKCS11_HKDF
 static CK_MECHANISM_INFO hkdfMechInfo = {
@@ -997,6 +1021,16 @@ CK_RV C_GetMechanismInfo(CK_SLOT_ID slotID, CK_MECHANISM_TYPE type,
         case CKM_ML_DSA:
             XMEMCPY(pInfo, &mldsaMechInfo, sizeof(CK_MECHANISM_INFO));
             break;
+#endif
+#ifdef WOLFPKCS11_LMS
+        case CKM_HSS:
+            XMEMCPY(pInfo, &hssMechInfo, sizeof(CK_MECHANISM_INFO));
+            break;
+#  ifdef WOLFPKCS11_LMS_PRIVATE
+        case CKM_HSS_KEY_PAIR_GEN:
+            XMEMCPY(pInfo, &hssKgMechInfo, sizeof(CK_MECHANISM_INFO));
+            break;
+#  endif
 #endif
 #ifdef WOLFPKCS11_HKDF
         case CKM_HKDF_DERIVE:

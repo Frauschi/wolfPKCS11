@@ -105,6 +105,15 @@ static CK_ATTRIBUTE_TYPE mldsaKeyParams[] = {
 #define MLDSA_KEY_PARAMS_CNT   (sizeof(mldsaKeyParams)/sizeof(*mldsaKeyParams))
 #endif
 
+#ifdef WOLFPKCS11_LMS
+/* HSS key data attributes. data[0] = optional CK_HSS_PARAMS, data[1] = pub. */
+static CK_ATTRIBUTE_TYPE hssKeyParams[] = {
+    CKA_PARAMETER_SET,  /* CK_HSS_PARAMS struct (optional, default if absent) */
+    CKA_VALUE           /* RFC 8554 raw HSS public key */
+};
+#define HSS_KEY_PARAMS_CNT     (sizeof(hssKeyParams)/sizeof(*hssKeyParams))
+#endif
+
 #ifndef NO_DH
 /* DH key data attributes. */
 static CK_ATTRIBUTE_TYPE dhKeyParams[] = {
@@ -678,6 +687,12 @@ static CK_RV SetAttributeValue(WP11_Session* session, WP11_Object* obj,
                 cnt = MLDSA_KEY_PARAMS_CNT;
                 break;
         #endif
+        #ifdef WOLFPKCS11_LMS
+            case CKK_HSS:
+                attrs = hssKeyParams;
+                cnt = HSS_KEY_PARAMS_CNT;
+                break;
+        #endif
         #ifndef NO_DH
             case CKK_DH:
                 attrs = dhKeyParams;
@@ -752,6 +767,15 @@ static CK_RV SetAttributeValue(WP11_Session* session, WP11_Object* obj,
         #ifdef WOLFPKCS11_MLDSA
                 case CKK_ML_DSA:
                     ret = WP11_Object_SetMldsaKey(obj, data, len);
+                    break;
+        #endif
+        #ifdef WOLFPKCS11_LMS
+                case CKK_HSS:
+                    ret = WP11_Object_SetHssKey(obj, data, len);
+                    if (ret == BAD_FUNC_ARG) {
+                        /* Private-key import is intentionally rejected. */
+                        return CKR_ATTRIBUTE_VALUE_INVALID;
+                    }
                     break;
         #endif
         #ifndef NO_DH
@@ -4495,6 +4519,17 @@ CK_RV C_SignInit(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
             init |= WP11_INIT_MLDSA_SIGN;
             break;
 #endif
+#ifdef WOLFPKCS11_LMS_PRIVATE
+        case CKM_HSS:
+            if (type != CKK_HSS)
+                return CKR_KEY_TYPE_INCONSISTENT;
+            if (pMechanism->pParameter != NULL ||
+                                              pMechanism->ulParameterLen != 0) {
+                return CKR_MECHANISM_PARAM_INVALID;
+            }
+            init |= WP11_INIT_HSS_SIGN;
+            break;
+#endif
 #ifndef NO_HMAC
     #ifndef NO_MD5
         case CKM_MD5_HMAC:
@@ -4879,6 +4914,31 @@ CK_RV C_Sign(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
 
             ret = WP11_Mldsa_Sign(pData, (int)ulDataLen, pSignature,
                                   &sigLen, obj, session);
+            *pulSignatureLen = sigLen;
+            break;
+#endif
+#ifdef WOLFPKCS11_LMS_PRIVATE
+        case CKM_HSS:
+            if (!WP11_Session_IsOpInitialized(session, WP11_INIT_HSS_SIGN))
+                return CKR_OPERATION_NOT_INITIALIZED;
+
+            sigLen = (word32)WP11_Hss_SigLen(obj);
+            if (sigLen == 0)
+                return CKR_FUNCTION_FAILED;
+            if (pSignature == NULL) {
+                *pulSignatureLen = sigLen;
+                return CKR_OK;
+            }
+            if (sigLen > (word32)*pulSignatureLen)
+                return CKR_BUFFER_TOO_SMALL;
+
+            sigLen = (word32)*pulSignatureLen;
+            ret = WP11_Hss_Sign(pData, (word32)ulDataLen, pSignature, &sigLen,
+                obj);
+            if (ret == NOT_AVAILABLE_E) {
+                /* State invalid (poisoned) — caller must reload. */
+                return CKR_DEVICE_ERROR;
+            }
             *pulSignatureLen = sigLen;
             break;
 #endif
@@ -5592,6 +5652,17 @@ CK_RV C_VerifyInit(CK_SESSION_HANDLE hSession,
             init |= WP11_INIT_MLDSA_VERIFY;
             break;
 #endif
+#ifdef WOLFPKCS11_LMS
+        case CKM_HSS:
+            if (type != CKK_HSS)
+                return CKR_KEY_TYPE_INCONSISTENT;
+            if (pMechanism->pParameter != NULL ||
+                                              pMechanism->ulParameterLen != 0) {
+                return CKR_MECHANISM_PARAM_INVALID;
+            }
+            init |= WP11_INIT_HSS_VERIFY;
+            break;
+#endif
 #ifndef NO_HMAC
     #ifndef NO_MD5
         case CKM_MD5_HMAC:
@@ -5923,6 +5994,14 @@ CK_RV C_Verify(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
 
             ret = WP11_Mldsa_Verify(pSignature, (int)ulSignatureLen, pData,
                                     (int)ulDataLen, &stat, obj, session);
+            break;
+#endif
+#ifdef WOLFPKCS11_LMS
+        case CKM_HSS:
+            if (!WP11_Session_IsOpInitialized(session, WP11_INIT_HSS_VERIFY))
+                return CKR_OPERATION_NOT_INITIALIZED;
+            ret = WP11_Hss_Verify(pSignature, (word32)ulSignatureLen, pData,
+                                  (word32)ulDataLen, &stat, obj);
             break;
 #endif
 #ifndef NO_HMAC
@@ -7217,6 +7296,41 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
                     rv = CKR_FUNCTION_FAILED;
             }
             break;
+#endif
+#ifdef WOLFPKCS11_LMS_PRIVATE
+        case CKM_HSS_KEY_PAIR_GEN: {
+            const CK_HSS_PARAMS* hssParams = NULL;
+            CK_ULONG hssParamsLen = 0;
+            if (pMechanism->pParameter != NULL) {
+                if (pMechanism->ulParameterLen != sizeof(CK_HSS_PARAMS))
+                    return CKR_MECHANISM_PARAM_INVALID;
+                hssParams = (const CK_HSS_PARAMS*)pMechanism->pParameter;
+                hssParamsLen = pMechanism->ulParameterLen;
+            }
+
+            *phPublicKey = *phPrivateKey = CK_INVALID_HANDLE;
+            rv = NewObject(session, CKK_HSS, CKO_PUBLIC_KEY,
+                           pPublicKeyTemplate, ulPublicKeyAttributeCount, &pub);
+            if (rv == CKR_OK) {
+                rv = NewObject(session, CKK_HSS, CKO_PRIVATE_KEY,
+                               pPrivateKeyTemplate, ulPrivateKeyAttributeCount,
+                               &priv);
+            }
+            if (rv == CKR_OK) {
+                ret = WP11_Hss_GenerateKeyPair(pub, priv, hssParams,
+                                               hssParamsLen,
+                                               WP11_Session_GetSlot(session));
+                if (ret == BAD_FUNC_ARG)
+                    rv = CKR_MECHANISM_PARAM_INVALID;
+                else if (ret != 0)
+                    rv = CKR_FUNCTION_FAILED;
+            }
+            break;
+        }
+#elif defined(WOLFPKCS11_LMS)
+        case CKM_HSS_KEY_PAIR_GEN:
+            /* Verify-only build: no keygen capability advertised. */
+            return CKR_MECHANISM_INVALID;
 #endif
 #ifdef WOLFPKCS11_MLKEM
         case CKM_ML_KEM_KEY_PAIR_GEN:

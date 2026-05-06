@@ -110,6 +110,15 @@ jobs:
     uses: ./.github/workflows/build-workflow.yml
     with:
       config: --enable-mlkem
+  lms:
+    uses: ./.github/workflows/build-workflow.yml
+    with:
+      config: --enable-lms
+  lms_private:
+    uses: ./.github/workflows/build-workflow.yml
+    with:
+      config: --enable-lms-private
+      check: make check && ./tests/lms_state_persistence_test
   debug:
     uses: ./.github/workflows/build-workflow.yml
     with:

@@ -26,6 +26,11 @@ noinst_PROGRAMS += tests/rsa_session_persistence_test
 tests_rsa_session_persistence_test_SOURCES = tests/rsa_session_persistence_test.c
 tests_rsa_session_persistence_test_LDADD =
 
+check_PROGRAMS += tests/lms_state_persistence_test
+noinst_PROGRAMS += tests/lms_state_persistence_test
+tests_lms_state_persistence_test_SOURCES = tests/lms_state_persistence_test.c
+tests_lms_state_persistence_test_LDADD =
+
 check_PROGRAMS += tests/debug_test
 noinst_PROGRAMS += tests/debug_test
 tests_debug_test_SOURCES = tests/debug_test.c
@@ -72,6 +77,7 @@ tests_pkcs11mtt_LDADD  += src/libwolfpkcs11.la
 tests_pkcs11str_LDADD  += src/libwolfpkcs11.la
 tests_token_path_test_LDADD += src/libwolfpkcs11.la
 tests_rsa_session_persistence_test_LDADD += src/libwolfpkcs11.la
+tests_lms_state_persistence_test_LDADD += src/libwolfpkcs11.la
 tests_debug_test_LDADD += src/libwolfpkcs11.la
 tests_object_id_uniqueness_test_LDADD += src/libwolfpkcs11.la
 tests_empty_pin_store_test_LDADD += src/libwolfpkcs11.la

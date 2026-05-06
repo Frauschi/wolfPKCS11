@@ -178,6 +178,7 @@ extern "C" {
 #define CKK_HKDF                              0x00000042UL
 #define CKK_ML_KEM                            0x00000049UL
 #define CKK_ML_DSA                            0x0000004AUL
+#define CKK_HSS                               0x00000046UL
 
 #ifdef WOLFPKCS11_NSS
 /* Not defined by NSS, but we need one */
@@ -262,6 +263,13 @@ extern "C" {
 /* KEM */
 #define CKA_ENCAPSULATE                       0x00000633UL
 #define CKA_DECAPSULATE                       0x00000634UL
+/* LMS/HSS (RFC 8554) */
+#define CKA_HSS_LEVELS                        0x00000617UL
+#define CKA_HSS_LMS_TYPE                      0x00000618UL
+#define CKA_HSS_LMOTS_TYPE                    0x00000619UL
+#define CKA_HSS_LMS_TYPES                     0x0000061AUL
+#define CKA_HSS_LMOTS_TYPES                   0x0000061BUL
+#define CKA_HSS_KEYS_REMAINING                0x0000061CUL
 
 #ifdef WOLFPKCS11_NSS
 #define CKA_NSS_EMAIL                         (CKA_NSS + 2)
@@ -365,6 +373,8 @@ extern "C" {
 #define CKM_ML_DSA_KEY_PAIR_GEN               0x0000001CUL
 #define CKM_ML_DSA                            0x0000001DUL
 #define CKM_HASH_ML_DSA                       0x0000001FUL
+#define CKM_HSS_KEY_PAIR_GEN                  0x00004032UL
+#define CKM_HSS                               0x00004033UL
 
 #ifdef WOLFPKCS11_NSS
 #define CKM_NSS_TLS_PRF_GENERAL_SHA256            (CKM_NSS + 21)
@@ -876,6 +886,36 @@ typedef CK_ULONG CK_ML_KEM_PARAMETER_SET_TYPE;
 #define CKP_ML_KEM_512         0x00000001UL
 #define CKP_ML_KEM_768         0x00000002UL
 #define CKP_ML_KEM_1024        0x00000003UL
+
+/* HSS / LMS / LMOTS algorithm identifiers (RFC 8554) used in CK_HSS_PARAMS. */
+typedef CK_ULONG CK_HSS_LEVELS;
+typedef CK_ULONG CK_LMS_TYPE;
+typedef CK_ULONG CK_LMOTS_TYPE;
+
+/* RFC 8554 LMS typecodes (subset supported by wolfSSL) */
+#define CKL_LMS_SHA256_M32_H5      0x00000005UL
+#define CKL_LMS_SHA256_M32_H10     0x00000006UL
+#define CKL_LMS_SHA256_M32_H15     0x00000007UL
+#define CKL_LMS_SHA256_M32_H20     0x00000008UL
+#define CKL_LMS_SHA256_M32_H25     0x00000009UL
+
+/* RFC 8554 LMOTS typecodes (subset supported by wolfSSL) */
+#define CKL_LMOTS_SHA256_N32_W1    0x00000001UL
+#define CKL_LMOTS_SHA256_N32_W2    0x00000002UL
+#define CKL_LMOTS_SHA256_N32_W4    0x00000003UL
+#define CKL_LMOTS_SHA256_N32_W8    0x00000004UL
+
+/* PKCS#11 v3.2 specifiedParams for CKM_HSS_KEY_PAIR_GEN. The `lm_type` and
+ * `lm_ots_type` arrays carry one entry per HSS level (1..ulLevels-1 unused
+ * entries are ignored). wolfSSL requires uniform (height, winternitz) across
+ * levels in its current API; mixed parameters are rejected with
+ * CKR_MECHANISM_PARAM_INVALID. */
+typedef struct CK_HSS_PARAMS {
+    CK_HSS_LEVELS ulLevels;        /* 1..WOLFSSL_LMS_MAX_LEVELS */
+    CK_LMS_TYPE   lm_type[8];      /* per-level LMS typecode */
+    CK_LMOTS_TYPE lm_ots_type[8];  /* per-level LMOTS typecode */
+} CK_HSS_PARAMS;
+typedef CK_HSS_PARAMS CK_PTR CK_HSS_PARAMS_PTR;
 
 
 /* Function list types. */

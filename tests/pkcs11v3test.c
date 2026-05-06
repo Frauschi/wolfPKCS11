@@ -1021,6 +1021,289 @@ static CK_RV test_copy_object_mldsa_key(void* args)
 }
 #endif /* WOLFPKCS11_MLDSA */
 
+#ifdef WOLFPKCS11_LMS
+
+static CK_KEY_TYPE hssKeyType = CKK_HSS;
+
+/* Build a CK_HSS_PARAMS for a 1-level HSS / LMS_H5 / W4 tree (32 sigs). */
+static void hss_test_make_params(CK_HSS_PARAMS* p)
+{
+    XMEMSET(p, 0, sizeof(*p));
+    p->ulLevels = 1;
+    p->lm_type[0] = CKL_LMS_SHA256_M32_H5;
+    p->lm_ots_type[0] = CKL_LMOTS_SHA256_N32_W4;
+}
+
+#ifdef WOLFPKCS11_LMS_PRIVATE
+/* Generate an HSS keypair with a small parameter set. Returns the new pub
+ * and priv handles via out-parameters. Either may be NULL. */
+static CK_RV gen_hss_keys(CK_SESSION_HANDLE session,
+                          CK_OBJECT_HANDLE* outPub,
+                          CK_OBJECT_HANDLE* outPriv,
+                          int onToken)
+{
+    CK_RV ret;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE priv = CK_INVALID_HANDLE;
+    CK_MECHANISM mech;
+    CK_HSS_PARAMS params;
+    CK_BBOOL token = (CK_BBOOL)onToken;
+    CK_ATTRIBUTE pubKeyTmpl[] = {
+        { CKA_VERIFY, &ckTrue, sizeof(ckTrue) },
+        { CKA_TOKEN,  &token,  sizeof(token)  }
+    };
+    CK_ATTRIBUTE privKeyTmpl[] = {
+        { CKA_SIGN,  &ckTrue, sizeof(ckTrue) },
+        { CKA_TOKEN, &token,  sizeof(token)  }
+    };
+
+    hss_test_make_params(&params);
+    mech.mechanism = CKM_HSS_KEY_PAIR_GEN;
+    mech.pParameter = &params;
+    mech.ulParameterLen = sizeof(params);
+
+    ret = funcList->C_GenerateKeyPair(session, &mech,
+        pubKeyTmpl, sizeof(pubKeyTmpl)/sizeof(*pubKeyTmpl),
+        privKeyTmpl, sizeof(privKeyTmpl)/sizeof(*privKeyTmpl), &pub, &priv);
+    CHECK_CKR(ret, "HSS Key Generation");
+
+    if (ret == CKR_OK && outPub != NULL) *outPub = pub;
+    if (ret == CKR_OK && outPriv != NULL) *outPriv = priv;
+    return ret;
+}
+
+/* Sign a message and verify it on the public-key side. */
+static CK_RV hss_sign_verify_one(CK_SESSION_HANDLE session,
+                                 CK_OBJECT_HANDLE priv,
+                                 CK_OBJECT_HANDLE pub,
+                                 const byte* msg, CK_ULONG msgLen)
+{
+    CK_RV ret;
+    CK_MECHANISM mech;
+    byte sig[8192];
+    CK_ULONG sigLen = sizeof(sig);
+
+    mech.mechanism = CKM_HSS;
+    mech.pParameter = NULL;
+    mech.ulParameterLen = 0;
+
+    ret = funcList->C_SignInit(session, &mech, priv);
+    CHECK_CKR(ret, "HSS C_SignInit");
+    if (ret == CKR_OK) {
+        ret = funcList->C_Sign(session, (CK_BYTE_PTR)msg, msgLen, sig, &sigLen);
+        CHECK_CKR(ret, "HSS C_Sign");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, pub);
+        CHECK_CKR(ret, "HSS C_VerifyInit");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Verify(session, (CK_BYTE_PTR)msg, msgLen, sig,
+            sigLen);
+        CHECK_CKR(ret, "HSS C_Verify");
+    }
+    /* Negative verify: flip a byte in the signature. */
+    if (ret == CKR_OK && sigLen > 0) {
+        sig[sigLen / 2] ^= 0x55;
+        ret = funcList->C_VerifyInit(session, &mech, pub);
+        CHECK_CKR(ret, "HSS C_VerifyInit (bad sig)");
+        if (ret == CKR_OK) {
+            ret = funcList->C_Verify(session, (CK_BYTE_PTR)msg, msgLen, sig,
+                sigLen);
+            CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID, "HSS bad-sig verify");
+        }
+    }
+    return ret;
+}
+
+/* Basic generate + sign + verify roundtrip, in-session keys. */
+static CK_RV test_hss_gen_sign_verify(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
+    static const byte msg[] = "wolfPKCS11 HSS roundtrip test";
+
+    ret = gen_hss_keys(session, &pub, &priv, 0);
+    if (ret == CKR_OK)
+        ret = hss_sign_verify_one(session, priv, pub, msg, sizeof(msg) - 1);
+
+    if (priv != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, priv);
+    if (pub != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, pub);
+    return ret;
+}
+
+/* Decrement of CKA_HSS_KEYS_REMAINING after each sign. */
+static CK_RV test_hss_keys_remaining(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
+    CK_ULONG remaining = 0;
+    CK_ATTRIBUTE attr = { CKA_HSS_KEYS_REMAINING, &remaining,
+        sizeof(remaining) };
+    static const byte msg[] = "kr";
+    int i;
+
+    ret = gen_hss_keys(session, &pub, &priv, 0);
+    if (ret == CKR_OK) {
+        ret = funcList->C_GetAttributeValue(session, priv, &attr, 1);
+        CHECK_CKR(ret, "HSS GetAttr CKA_HSS_KEYS_REMAINING");
+    }
+    if (ret == CKR_OK) {
+        /* H=5 → 32 sigs total. */
+        CHECK_COND(remaining == 32, ret, "HSS initial keys remaining is 32");
+    }
+    for (i = 0; ret == CKR_OK && i < 4; i++) {
+        ret = hss_sign_verify_one(session, priv, pub, msg, sizeof(msg) - 1);
+        if (ret == CKR_OK) {
+            ret = funcList->C_GetAttributeValue(session, priv, &attr, 1);
+            CHECK_CKR(ret, "HSS GetAttr after sign");
+            if (ret == CKR_OK) {
+                CHECK_COND(remaining == (CK_ULONG)(32 - 1 - i), ret,
+                    "HSS keys remaining decremented");
+            }
+        }
+    }
+
+    if (priv != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, priv);
+    if (pub != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, pub);
+    return ret;
+}
+
+/* CKA_VALUE on a private HSS key MUST be CK_UNAVAILABLE_INFORMATION even
+ * when CKA_EXTRACTABLE = TRUE. Verify with both default and explicit flag. */
+static CK_RV test_hss_priv_value_blocked(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
+    CK_ATTRIBUTE q;
+
+    ret = gen_hss_keys(session, &pub, &priv, 0);
+    if (ret == CKR_OK) {
+        /* Query length only. */
+        q.type = CKA_VALUE;
+        q.pValue = NULL;
+        q.ulValueLen = 0;
+        ret = funcList->C_GetAttributeValue(session, priv, &q, 1);
+        /* Spec: when sensitive/unavailable, ulValueLen is set to
+         * CK_UNAVAILABLE_INFORMATION and the call may return CKR_OK or
+         * CKR_ATTRIBUTE_SENSITIVE. We accept either. */
+        CHECK_COND(q.ulValueLen == CK_UNAVAILABLE_INFORMATION, ret,
+            "HSS private CKA_VALUE returns UNAVAILABLE");
+    }
+    /* Try setting CKA_EXTRACTABLE = TRUE and re-query — must still be blocked. */
+    if (ret == CKR_OK) {
+        CK_BBOOL t = CK_TRUE;
+        CK_ATTRIBUTE setExtractable = { CKA_EXTRACTABLE, &t, sizeof(t) };
+        (void)funcList->C_SetAttributeValue(session, priv, &setExtractable, 1);
+        q.type = CKA_VALUE;
+        q.pValue = NULL;
+        q.ulValueLen = 0;
+        ret = funcList->C_GetAttributeValue(session, priv, &q, 1);
+        CHECK_COND(q.ulValueLen == CK_UNAVAILABLE_INFORMATION, ret,
+            "HSS private CKA_VALUE blocked even with EXTRACTABLE=TRUE");
+    }
+
+    if (priv != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, priv);
+    if (pub != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, pub);
+    return ret;
+}
+
+/* Copy of an HSS private key must be rejected. */
+static CK_RV test_hss_copy_priv_rejected(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE copy = CK_INVALID_HANDLE;
+
+    ret = gen_hss_keys(session, &pub, &priv, 0);
+    if (ret == CKR_OK) {
+        ret = funcList->C_CopyObject(session, priv, NULL, 0, &copy);
+        /* Copy is rejected; exact CK_RV depends on internal mapping but
+         * MUST not be CKR_OK. */
+        CHECK_COND(ret != CKR_OK, ret, "HSS copy of private key rejected");
+        ret = (ret != CKR_OK) ? CKR_OK : CKR_FUNCTION_FAILED;
+    }
+    if (copy != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, copy);
+    if (priv != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, priv);
+    if (pub != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, pub);
+    return ret;
+}
+#endif /* WOLFPKCS11_LMS_PRIVATE */
+
+/* Private-key import is rejected unconditionally (even when LMS_PRIVATE on).
+ * This guards against an attacker installing a state-forked private key. */
+static CK_RV test_hss_priv_import_rejected(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_CLASS cls = CKO_PRIVATE_KEY;
+    CK_BYTE bogus[64];
+    CK_OBJECT_HANDLE h = CK_INVALID_HANDLE;
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &cls,        sizeof(cls)        },
+        { CKA_KEY_TYPE, &hssKeyType, sizeof(hssKeyType) },
+        { CKA_VALUE,    bogus,       sizeof(bogus)      }
+    };
+    XMEMSET(bogus, 0xAB, sizeof(bogus));
+
+    ret = funcList->C_CreateObject(session, tmpl,
+        sizeof(tmpl)/sizeof(*tmpl), &h);
+    CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+        "HSS private-key import rejected");
+    if (ret == CKR_ATTRIBUTE_VALUE_INVALID)
+        ret = CKR_OK;
+    if (h != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, h);
+    return ret;
+}
+
+#ifndef WOLFPKCS11_LMS_PRIVATE
+/* In a verify-only build, attempting to keygen must report
+ * CKR_MECHANISM_INVALID since CKM_HSS_KEY_PAIR_GEN is not advertised. */
+static CK_RV test_hss_verify_only_no_keygen(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_MECHANISM mech;
+    CK_HSS_PARAMS params;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
+    CK_ATTRIBUTE pubKeyTmpl[] = {
+        { CKA_VERIFY, &ckTrue, sizeof(ckTrue) }
+    };
+    CK_ATTRIBUTE privKeyTmpl[] = {
+        { CKA_SIGN, &ckTrue, sizeof(ckTrue) }
+    };
+
+    hss_test_make_params(&params);
+    mech.mechanism = CKM_HSS_KEY_PAIR_GEN;
+    mech.pParameter = &params;
+    mech.ulParameterLen = sizeof(params);
+
+    ret = funcList->C_GenerateKeyPair(session, &mech,
+        pubKeyTmpl, 1, privKeyTmpl, 1, &pub, &priv);
+    CHECK_CKR_FAIL(ret, CKR_MECHANISM_INVALID,
+        "HSS keygen rejected in verify-only build");
+    if (ret == CKR_MECHANISM_INVALID)
+        ret = CKR_OK;
+    return ret;
+}
+#endif /* !WOLFPKCS11_LMS_PRIVATE */
+
+#endif /* WOLFPKCS11_LMS */
+
 #ifdef WOLFPKCS11_MLKEM
 
 static CK_KEY_TYPE mlkemKeyType = CKK_ML_KEM;
@@ -2774,6 +3057,17 @@ static TEST_FUNC testFunc[] = {
     PKCS11TEST_FUNC_SESS_DECL(test_mldsa_fixed_keys_seed),
     PKCS11TEST_FUNC_SESS_DECL(test_mldsa_fixed_keys_both),
     PKCS11TEST_FUNC_SESS_DECL(test_copy_object_mldsa_key),
+#endif
+#ifdef WOLFPKCS11_LMS
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_priv_import_rejected),
+#  ifdef WOLFPKCS11_LMS_PRIVATE
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_gen_sign_verify),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_keys_remaining),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_priv_value_blocked),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_copy_priv_rejected),
+#  else
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_verify_only_no_keygen),
+#  endif
 #endif
 #ifdef WOLFPKCS11_MLKEM
     PKCS11TEST_FUNC_SESS_DECL(test_mlkem_gen_keys),

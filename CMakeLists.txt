@@ -510,6 +510,41 @@ if(WOLFPKCS11_MLKEM)
 endif()
 
 
+# LMS/HSS verify-only support (RFC 8554)
+add_option("WOLFPKCS11_LMS"
+    "Enable wolfPKCS11 LMS/HSS verification (default: disabled)"
+    "no" "yes;no"
+)
+
+# LMS/HSS keygen + signing (stateful, EXPERIMENTAL); implies WOLFPKCS11_LMS
+add_option("WOLFPKCS11_LMS_PRIVATE"
+    "Enable wolfPKCS11 LMS/HSS keygen + signing (EXPERIMENTAL, default: disabled)"
+    "no" "yes;no"
+)
+
+if(WOLFPKCS11_LMS_PRIVATE AND NOT WOLFPKCS11_LMS)
+    message(STATUS "WOLFPKCS11_LMS_PRIVATE implies WOLFPKCS11_LMS; enabling automatically")
+    override_cache(WOLFPKCS11_LMS "yes")
+endif()
+
+if(WOLFPKCS11_LMS)
+    if(NOT WOLFPKCS11_PKCS11_V3_2)
+        message(STATUS "LMS/HSS requires PKCS#11 v3.2 support — enabling WOLFPKCS11_PKCS11_V3_2 automatically")
+        override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
+        if(NOT WOLFPKCS11_PKCS11_V3_0)
+            override_cache(WOLFPKCS11_PKCS11_V3_0 "yes")
+            list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_PKCS11_V3_0")
+        endif()
+        list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_PKCS11_V3_2")
+    endif()
+    list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_LMS")
+endif()
+
+if(WOLFPKCS11_LMS_PRIVATE)
+    list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_LMS_PRIVATE")
+endif()
+
+
 # If wolfpkcs11/options.h exists, delete it to avoid
 # a mixup with build/wolfpkcs11/options.h.
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/wolfpkcs11/options.h")

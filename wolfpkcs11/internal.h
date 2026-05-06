@@ -36,6 +36,10 @@
 #include <wolfssl/wolfcrypt/dilithium.h>
 #endif
 
+#ifdef WOLFPKCS11_LMS
+#include <wolfssl/wolfcrypt/wc_lms.h>
+#endif
+
 #include <wolfpkcs11/pkcs11.h>
 #include <wolfpkcs11/version.h>
 
@@ -115,6 +119,30 @@ C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT"
 
 #if defined(WOLFPKCS11_MLKEM) && !defined(WOLFSSL_HAVE_MLKEM)
 #error Compiling with ML-KEM requires ML-KEM support in wolfSSL.
+#endif
+
+#if defined(WOLFPKCS11_LMS) && !defined(WOLFSSL_HAVE_LMS)
+#error WOLFPKCS11_LMS requires wolfSSL built with --enable-lms (WOLFSSL_HAVE_LMS).
+#endif
+
+/* wolfSSL master removed the standalone WOLFSSL_WC_LMS toggle; the wolfCrypt
+ * implementation is now the default when --enable-lms is passed. Sign/keygen
+ * are gated by the absence of WOLFSSL_LMS_VERIFY_ONLY. */
+#if defined(WOLFPKCS11_LMS_PRIVATE) && defined(WOLFSSL_LMS_VERIFY_ONLY)
+#error WOLFPKCS11_LMS_PRIVATE requires wolfSSL built without --enable-lms=verify-only.
+#endif
+
+#if defined(WOLFPKCS11_LMS_PRIVATE) && !defined(WOLFPKCS11_LMS)
+#error WOLFPKCS11_LMS_PRIVATE requires WOLFPKCS11_LMS.
+#endif
+
+#if defined(WOLFPKCS11_LMS_PRIVATE) && defined(WOLFPKCS11_NO_STORE)
+#error WOLFPKCS11_LMS_PRIVATE requires storage; do not combine with WOLFPKCS11_NO_STORE.
+#endif
+
+#if defined(WOLFPKCS11_LMS_PRIVATE) && defined(WOLFPKCS11_TPM_STORE)
+#error WOLFPKCS11_LMS_PRIVATE is not supported with WOLFPKCS11_TPM_STORE \
+       (HSS state files are too large for TPM NV).
 #endif
 
 /* We need the next two for NSS, just for storage, even if we have no algos */
@@ -218,6 +246,11 @@ C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT"
 #define WP11_FLAG_DERIVE               0x00040000
 #define WP11_FLAG_ENCAPSULATE          0x00080000
 #define WP11_FLAG_DECAPSULATE          0x00100000
+/* Internal poison/reload marker for HSS private keys. Set after a successful
+ * keygen or wc_LmsKey_Reload; cleared on any state-write failure or sign
+ * error. When clear, signing is refused with CKR_DEVICE_ERROR until the key
+ * is reloaded from durable storage. */
+#define WP11_FLAG_HSS_STATE_VALID      0x00200000
 
 /* Flags for token. */
 #define WP11_TOKEN_FLAG_USER_PIN_SET   0x00000001
@@ -265,6 +298,8 @@ C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT"
 #define WP11_INIT_TLS_MAC_VERIFY       0x0071
 #define WP11_INIT_MLDSA_SIGN           0x0080
 #define WP11_INIT_MLDSA_VERIFY         0x0081
+#define WP11_INIT_HSS_SIGN             0x0090
+#define WP11_INIT_HSS_VERIFY           0x0091
 
 /* Operation categories for CKR_OPERATION_ACTIVE checks */
 #define WP11_OP_ENCRYPT                0
@@ -544,6 +579,27 @@ WP11_LOCAL int WP11_Mldsa_Sign(unsigned char* data, word32 dataLen, unsigned cha
 WP11_LOCAL int WP11_Mldsa_Verify(unsigned char* sig, word32 sigLen, unsigned char* data,
                                  word32 dataLen, int* stat, WP11_Object* pub,
                                  WP11_Session* session);
+
+#ifdef WOLFPKCS11_LMS
+WP11_LOCAL int WP11_Object_SetHssKey(WP11_Object* object, unsigned char** data,
+                                     CK_ULONG* len);
+WP11_LOCAL int WP11_Hss_Verify(unsigned char* sig, word32 sigLen,
+                               unsigned char* data, word32 dataLen, int* stat,
+                               WP11_Object* pub);
+WP11_LOCAL int WP11_Hss_SigLen(WP11_Object* key);
+WP11_LOCAL int WP11_Hss_PubLen(WP11_Object* key);
+WP11_LOCAL int WP11_Hss_GetParameters(WP11_Object* key, int* levels, int* height,
+                                      int* winternitz);
+#endif
+#ifdef WOLFPKCS11_LMS_PRIVATE
+WP11_LOCAL int WP11_Hss_GenerateKeyPair(WP11_Object* pub, WP11_Object* priv,
+                                        const CK_HSS_PARAMS* params,
+                                        CK_ULONG paramsLen, WP11_Slot* slot);
+WP11_LOCAL int WP11_Hss_Sign(unsigned char* data, word32 dataLen,
+                             unsigned char* sig, word32* sigLen,
+                             WP11_Object* priv);
+WP11_LOCAL int WP11_Hss_SigsLeft(WP11_Object* key, word32* remaining);
+#endif
 
 WP11_LOCAL int WP11_Dh_GenerateKeyPair(WP11_Object* pub, WP11_Object* priv,
                             WP11_Slot* slot);

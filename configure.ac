@@ -566,6 +566,44 @@ then
     AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_MLKEM"
 fi
 
+# LMS/HSS verify-only support (RFC 8554)
+AC_ARG_ENABLE([lms],
+    [AS_HELP_STRING([--enable-lms],[Enable LMS/HSS verification and public-key import (default: disabled)])],
+    [ ENABLED_LMS=$enableval ],
+    [ ENABLED_LMS=no ]
+    )
+
+# LMS/HSS keygen + signing (stateful, EXPERIMENTAL); implies --enable-lms
+AC_ARG_ENABLE([lms-private],
+    [AS_HELP_STRING([--enable-lms-private],[Enable LMS/HSS keygen and signing (EXPERIMENTAL, stateful private keys, default: disabled)])],
+    [ ENABLED_LMS_PRIVATE=$enableval ],
+    [ ENABLED_LMS_PRIVATE=no ]
+    )
+
+if test "$ENABLED_LMS_PRIVATE" = "yes" && test "$ENABLED_LMS" = "no"
+then
+    AC_MSG_NOTICE([--enable-lms-private implies --enable-lms; enabling])
+    ENABLED_LMS=yes
+fi
+
+if test "$ENABLED_LMS" = "yes"
+then
+    if test "$ENABLED_PKCS11V3_2" = "no"; then
+        ENABLED_PKCS11V3_2=yes
+        AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_2"
+        if test "$ENABLED_PKCS11V3_0" = "no"; then
+            ENABLED_PKCS11V3_0=yes
+            AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_0"
+        fi
+    fi
+    AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_LMS"
+fi
+
+if test "$ENABLED_LMS_PRIVATE" = "yes"
+then
+    AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_LMS_PRIVATE"
+fi
+
 
 AM_CONDITIONAL([BUILD_STATIC],[test "x$enable_shared" = "xno"])
 
@@ -755,6 +793,8 @@ echo "   * ECC:                        $ENABLED_ECC"
 echo "   * HKDF:                       $ENABLED_HKDF"
 echo "   * ML-DSA:                     $ENABLED_MLDSA"
 echo "   * ML-KEM:                     $ENABLED_MLKEM"
+echo "   * LMS/HSS verify:             $ENABLED_LMS"
+echo "   * LMS/HSS sign+keygen (EXP):  $ENABLED_LMS_PRIVATE"
 echo "   * NSS modifications:          $ENABLED_NSS"
 echo "   * Default token path:         $WOLFPKCS11_DEFAULT_TOKEN_PATH"
 echo "   * PKCS#11 Version 3.0:        $ENABLED_PKCS11V3_0"

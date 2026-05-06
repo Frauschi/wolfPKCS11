@@ -74,6 +74,70 @@ As ML-KEM is a feature of PKCS#11 version 3.2, support for that is required,
 too. Hence, to enable all in wolfPKCS11, add `--enable-pkcs11v32 --enable-mlkem`
 during the configure step.
 
+### Optional: LMS / HSS hash-based signatures (RFC 8554)
+
+LMS (Leighton-Micali) and its hierarchical extension HSS are hash-based
+one-time signature schemes specified in
+[RFC 8554](https://www.rfc-editor.org/rfc/rfc8554) and standardized in
+NIST SP 800-208. The PKCS#11 v3.2 surface for HSS uses `CKK_HSS`,
+`CKM_HSS_KEY_PAIR_GEN`, and `CKM_HSS`. Note that `C_Sign` and `C_Verify`
+operate on the **whole message** (not a digest).
+
+Two separate compile flags split this feature into a safe verifier-only
+build and a stateful signer build:
+
+| Flag | What it enables | Risk |
+|---|---|---|
+| `--enable-lms` (CMake `WOLFPKCS11_LMS=yes`) | Verification + public-key import only. | None — verify is stateless. |
+| `--enable-lms-private` (CMake `WOLFPKCS11_LMS_PRIVATE=yes`, implies `--enable-lms`) | Adds key generation and signing. **EXPERIMENTAL.** | Stateful private keys. Mismanagement causes one-time-key reuse and complete forgery. |
+
+Build wolfSSL with `--enable-lms` (or `--enable-lms=small` for a smaller
+footprint) and then build wolfPKCS11 with one of the two flags above.
+For `--enable-lms-private` wolfSSL must NOT be built with
+`--enable-lms=verify-only` (the build will fail at the prerequisite check).
+
+#### Operational responsibilities for `--enable-lms-private`
+
+LMS/HSS are stateful: every signature consumes a one-time key, and re-using
+a leaf index breaks security catastrophically. wolfPKCS11 implements the
+following safeguards on top of the wolfSSL state callbacks:
+
+* The per-signature state file is encrypted with the token master key and
+  written via an `mkstemp` + `fsync(file)` + `rename` + `fsync(parent dir)`
+  sequence, so a returned signature always corresponds to a state index that
+  is durably on disk. The on-disk header (parameters, version) is bound into
+  the AES-GCM tag so any tampering is detected at decrypt time.
+* On any state-write failure the in-memory state is *poisoned* — subsequent
+  sign attempts return `CKR_DEVICE_ERROR` until the key is reloaded from
+  durable storage.
+* **Private key import** (`C_CreateObject` with `CKO_PRIVATE_KEY` +
+  `CKK_HSS`) is rejected unconditionally. There is no way to install an
+  HSS private key with a caller-controlled state index.
+* **Private key export** (`C_GetAttributeValue` for `CKA_VALUE` on a private
+  HSS key) returns `CK_UNAVAILABLE_INFORMATION` regardless of
+  `CKA_EXTRACTABLE` / `CKA_SENSITIVE`.
+* **Copying** an HSS private key (`C_CopyObject`) is rejected.
+
+The operator is responsible for:
+
+* **Never copying or snapshotting the token directory** while a signing key
+  is present. A restored copy would re-issue already-consumed indices.
+* Treating HSS private keys as bound to the device they were generated on.
+  `rsync`, `cp`, filesystem snapshots and backup tools will silently break
+  security if used on a token with active HSS keys.
+* Storing the token directory on a journaled filesystem (durability
+  assumptions rely on `fsync` semantics).
+
+The default parameter set when none is supplied is `levels = 1`,
+`H = 10`, `W = 8` (1024 lifetime signatures, ~3 KiB signature). Mixed
+`(H, W)` across HSS levels is rejected with `CKR_MECHANISM_PARAM_INVALID`
+because the underlying wolfSSL API requires uniform parameters.
+
+For non-production rigs (e.g., tmpfs-backed test harnesses) the env var
+`WOLFPKCS11_HSS_RELAX_FSYNC=1` skips the per-signature `fsync` calls.
+**Never set this in production.** A power loss or kernel panic can then
+expose a one-time-key reuse window.
+
 ### Build options and defines
 
 #### Define WOLFPKCS11_TPM_STORE
@@ -219,6 +283,8 @@ cmake -DCMAKE_PREFIX_PATH=/path/to/wolfssl/install ..
 | `WOLFPKCS11_PKCS11_V3_2` | `no` | PKCS#11 v3.2 support |
 | `WOLFPKCS11_MLDSA` | `no` | ML-DSA support |
 | `WOLFPKCS11_MLKEM` | `no` | ML-KEM support |
+| `WOLFPKCS11_LMS` | `no` | LMS/HSS verification (RFC 8554) |
+| `WOLFPKCS11_LMS_PRIVATE` | `no` | LMS/HSS keygen + signing (EXPERIMENTAL) |
 | `WOLFPKCS11_EXAMPLES` | `yes` | Build examples |
 | `WOLFPKCS11_TESTS` | `yes` | Build and register tests |
 | `WOLFPKCS11_COVERAGE` | `no` | Code coverage support |
