@@ -11,6 +11,21 @@ on:
           required: false
           type: string
           default: 'make check'
+        wolfssl_lms:
+          description: 'wolfSSL LMS configure flag (small|verify-only|<empty for full>)'
+          required: false
+          type: string
+          default: 'small'
+        wolfssl_lms_levels:
+          description: 'WOLFSSL_LMS_MAX_LEVELS to compile wolfSSL with'
+          required: false
+          type: string
+          default: '2'
+        wolfssl_lms_height:
+          description: 'WOLFSSL_LMS_MAX_HEIGHT to compile wolfSSL with'
+          required: false
+          type: string
+          default: '10'
 
 jobs:
   build:
@@ -34,9 +49,13 @@ jobs:
     - name: wolfssl configure
       working-directory: ./wolfssl
       run: |
+        LMS_FLAG="--enable-lms"
+        if [ -n "${{ inputs.wolfssl_lms }}" ]; then
+          LMS_FLAG="--enable-lms=${{ inputs.wolfssl_lms }}"
+        fi
         ./configure --enable-cryptocb --enable-aescfb --enable-rsapss --enable-keygen --enable-pwdbased --enable-scrypt --enable-md5 \
-            --enable-mldsa --enable-lms=small \
-            C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT -DHAVE_AES_ECB -DHAVE_AES_KEYWRAP -DWOLFSSL_LMS_MAX_LEVELS=2 -DWOLFSSL_LMS_MAX_HEIGHT=10"
+            --enable-mldsa $LMS_FLAG \
+            C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT -DHAVE_AES_ECB -DHAVE_AES_KEYWRAP -DWOLFSSL_LMS_MAX_LEVELS=${{ inputs.wolfssl_lms_levels }} -DWOLFSSL_LMS_MAX_HEIGHT=${{ inputs.wolfssl_lms_height }}"
     - name: wolfssl make install
       working-directory: ./wolfssl
       run: make

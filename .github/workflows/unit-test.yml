@@ -118,7 +118,22 @@ jobs:
     uses: ./.github/workflows/build-workflow.yml
     with:
       config: --enable-lms-private
-      check: make check && ./tests/lms_state_persistence_test
+      # lms_state_persistence_test is in check_PROGRAMS — `make check` already
+      # runs it. No explicit second invocation; the original duplicate ran
+      # the test twice in the same token directory which masked some bugs.
+      check: make check
+  # Full (non-`small`) wolfSSL LMS build with larger MAX_LEVELS/MAX_HEIGHT
+  # to exercise multi-level HSS and the H10 path. The `small` build that the
+  # other LMS jobs use caps levels and height at 2/10, hiding bugs in the
+  # multi-level / H>5 code paths.
+  lms_private_full:
+    uses: ./.github/workflows/build-workflow.yml
+    with:
+      config: --enable-lms-private
+      check: make check
+      wolfssl_lms: ''
+      wolfssl_lms_levels: '4'
+      wolfssl_lms_height: '15'
   debug:
     uses: ./.github/workflows/build-workflow.yml
     with:

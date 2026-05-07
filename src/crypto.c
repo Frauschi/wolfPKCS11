@@ -7309,11 +7309,39 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
         case CKM_HSS_KEY_PAIR_GEN: {
             const CK_HSS_PARAMS* hssParams = NULL;
             CK_ULONG hssParamsLen = 0;
+            CK_ATTRIBUTE* tokAttr = NULL;
+            CK_BBOOL pubTok = CK_FALSE, privTok = CK_FALSE;
             if (pMechanism->pParameter != NULL) {
                 if (pMechanism->ulParameterLen != sizeof(CK_HSS_PARAMS))
                     return CKR_MECHANISM_PARAM_INVALID;
                 hssParams = (const CK_HSS_PARAMS*)pMechanism->pParameter;
                 hssParamsLen = pMechanism->ulParameterLen;
+            }
+
+            /* Stateful one-time signature keys MUST be on-token. A session-
+             * only HSS private key has no durable anchor for the leaf index;
+             * a process crash between sign and cleanup releases a signature
+             * whose OTS index was never persisted, allowing OTS-key reuse on
+             * the next invocation. Refuse session-only keys outright. */
+            FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount,
+                CKA_TOKEN, &tokAttr);
+            if (tokAttr != NULL && tokAttr->pValue != NULL &&
+                    tokAttr->ulValueLen == sizeof(CK_BBOOL)) {
+                pubTok = *(CK_BBOOL*)tokAttr->pValue;
+            }
+            tokAttr = NULL;
+            FindAttributeType(pPrivateKeyTemplate, ulPrivateKeyAttributeCount,
+                CKA_TOKEN, &tokAttr);
+            if (tokAttr != NULL && tokAttr->pValue != NULL &&
+                    tokAttr->ulValueLen == sizeof(CK_BBOOL)) {
+                privTok = *(CK_BBOOL*)tokAttr->pValue;
+            }
+            if (!pubTok || !privTok) {
+                /* CKR_TEMPLATE_INCONSISTENT signals "the supplied template
+                 * conflicts with what this mechanism requires" — exactly
+                 * matches PKCS#11 v3.2 guidance for unsupported attribute
+                 * combinations. */
+                return CKR_TEMPLATE_INCONSISTENT;
             }
 
             *phPublicKey = *phPrivateKey = CK_INVALID_HANDLE;
@@ -7486,19 +7514,6 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
         rv = AddObject(session, priv, pPrivateKeyTemplate,
                                       ulPrivateKeyAttributeCount, phPrivateKey);
     }
-#ifdef WOLFPKCS11_LMS_PRIVATE
-    /* HSS keygen writes the genesis state via the wolfSSL write CB during
-     * MakeKey, BEFORE the object has a slot handle. The CB stashes those
-     * bytes; once AddObject has assigned the handle, flush them to the
-     * durable state file. If this fails, the keygen is rolled back: the
-     * object cannot be used to sign without a valid persisted state. */
-    if (rv == CKR_OK && priv != NULL && pMechanism != NULL &&
-            pMechanism->mechanism == CKM_HSS_KEY_PAIR_GEN) {
-        if (WP11_Hss_FlushDeferredState(priv) != 0)
-            rv = CKR_FUNCTION_FAILED;
-    }
-#endif
-
     if (pub != NULL && rv == CKR_OK) {
         rv = SetInitialStates(pub);
     }

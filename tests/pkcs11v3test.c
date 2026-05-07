@@ -1040,7 +1040,12 @@ static void hss_test_make_params(CK_HSS_PARAMS* p)
 
 #ifdef WOLFPKCS11_LMS_PRIVATE
 /* Generate an HSS keypair with a small parameter set. Returns the new pub
- * and priv handles via out-parameters. Either may be NULL. */
+ * and priv handles via out-parameters. Either may be NULL.
+ *
+ * HSS keys are always token-resident in this build (session-only keys
+ * cannot durably anchor the leaf-index counter). The onToken parameter is
+ * retained for the negative-path test that verifies session-only keygen
+ * is rejected with CKR_TEMPLATE_INCONSISTENT. */
 static CK_RV gen_hss_keys(CK_SESSION_HANDLE session,
                           CK_OBJECT_HANDLE* outPub,
                           CK_OBJECT_HANDLE* outPriv,
@@ -1128,7 +1133,7 @@ static CK_RV test_hss_gen_sign_verify(void* args)
     CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
     static const byte msg[] = "wolfPKCS11 HSS roundtrip test";
 
-    ret = gen_hss_keys(session, &pub, &priv, 0);
+    ret = gen_hss_keys(session, &pub, &priv, 1);
     if (ret == CKR_OK)
         ret = hss_sign_verify_one(session, priv, pub, msg, sizeof(msg) - 1);
 
@@ -1139,35 +1144,43 @@ static CK_RV test_hss_gen_sign_verify(void* args)
     return ret;
 }
 
-/* Decrement of CKA_HSS_KEYS_REMAINING after each sign. */
+/* Decrement of CKA_HSS_KEYS_REMAINING by exactly one per sign. The initial
+ * count is verified against the expected total (2^(L*H) = 32 for L=1/H=5),
+ * but the comparison going forward is "before - after == 1" so it cannot
+ * be broken by changes to wolfSSL's leaf-index encoding. */
 static CK_RV test_hss_keys_remaining(void* args)
 {
     CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
     CK_RV ret;
     CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
     CK_ULONG remaining = 0;
+    CK_ULONG remainingPrev = 0;
     CK_ATTRIBUTE attr = { CKA_HSS_KEYS_REMAINING, &remaining,
         sizeof(remaining) };
     static const byte msg[] = "kr";
     int i;
 
-    ret = gen_hss_keys(session, &pub, &priv, 0);
+    ret = gen_hss_keys(session, &pub, &priv, 1);
     if (ret == CKR_OK) {
         ret = funcList->C_GetAttributeValue(session, priv, &attr, 1);
         CHECK_CKR(ret, "HSS GetAttr CKA_HSS_KEYS_REMAINING");
     }
     if (ret == CKR_OK) {
-        /* H=5 → 32 sigs total. */
-        CHECK_COND(remaining == 32, ret, "HSS initial keys remaining is 32");
+        /* L=1, H=5 → 2^5 = 32. Allow the initial value to be exactly 32
+         * (no signs yet). Any other value is a regression. */
+        CHECK_COND(remaining == 32, ret,
+            "HSS initial keys remaining must equal 2^(L*H) = 32");
     }
     for (i = 0; ret == CKR_OK && i < 4; i++) {
+        remainingPrev = remaining;
         ret = hss_sign_verify_one(session, priv, pub, msg, sizeof(msg) - 1);
         if (ret == CKR_OK) {
             ret = funcList->C_GetAttributeValue(session, priv, &attr, 1);
             CHECK_CKR(ret, "HSS GetAttr after sign");
             if (ret == CKR_OK) {
-                CHECK_COND(remaining == (CK_ULONG)(32 - 1 - i), ret,
-                    "HSS keys remaining decremented");
+                CHECK_COND(remainingPrev > 0 &&
+                           remaining == remainingPrev - 1, ret,
+                    "HSS keys remaining must decrement by exactly one per sign");
             }
         }
     }
@@ -1176,6 +1189,65 @@ static CK_RV test_hss_keys_remaining(void* args)
         funcList->C_DestroyObject(session, priv);
     if (pub != CK_INVALID_HANDLE)
         funcList->C_DestroyObject(session, pub);
+    return ret;
+}
+
+/* Session-only HSS keygen MUST be rejected (CKR_TEMPLATE_INCONSISTENT).
+ * A session-only stateful key has no durable anchor for the leaf index;
+ * a process crash after sign would leak a signature whose OTS index was
+ * never persisted, allowing reuse on the next invocation. */
+static CK_RV test_hss_session_keygen_rejected(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
+    CK_MECHANISM mech;
+    CK_HSS_PARAMS params;
+    CK_BBOOL fls = CK_FALSE;
+    CK_BBOOL tru = CK_TRUE;
+    CK_ATTRIBUTE pubTmpl[] = {
+        { CKA_VERIFY, &ckTrue, sizeof(ckTrue) },
+        { CKA_TOKEN,  &fls,    sizeof(fls)    }
+    };
+    CK_ATTRIBUTE privTmpl[] = {
+        { CKA_SIGN,  &ckTrue, sizeof(ckTrue) },
+        { CKA_TOKEN, &fls,    sizeof(fls)    }
+    };
+
+    hss_test_make_params(&params);
+    mech.mechanism = CKM_HSS_KEY_PAIR_GEN;
+    mech.pParameter = &params;
+    mech.ulParameterLen = sizeof(params);
+
+    /* Both pub and priv session-only — must reject. */
+    ret = funcList->C_GenerateKeyPair(session, &mech,
+        pubTmpl, sizeof(pubTmpl)/sizeof(*pubTmpl),
+        privTmpl, sizeof(privTmpl)/sizeof(*privTmpl), &pub, &priv);
+    CHECK_CKR_FAIL(ret, CKR_TEMPLATE_INCONSISTENT,
+        "HSS session-only keygen must be rejected");
+    if (ret == CKR_TEMPLATE_INCONSISTENT)
+        ret = CKR_OK;
+    if (priv != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, priv);
+    if (pub != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, pub);
+
+    /* Mixed (token pub, session priv) also rejected. */
+    pub = priv = CK_INVALID_HANDLE;
+    pubTmpl[1].pValue = &tru;
+    privTmpl[1].pValue = &fls;
+    ret = funcList->C_GenerateKeyPair(session, &mech,
+        pubTmpl, sizeof(pubTmpl)/sizeof(*pubTmpl),
+        privTmpl, sizeof(privTmpl)/sizeof(*privTmpl), &pub, &priv);
+    CHECK_CKR_FAIL(ret, CKR_TEMPLATE_INCONSISTENT,
+        "HSS mixed (token pub, session priv) keygen must be rejected");
+    if (ret == CKR_TEMPLATE_INCONSISTENT)
+        ret = CKR_OK;
+    if (priv != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, priv);
+    if (pub != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, pub);
+
     return ret;
 }
 
@@ -1188,7 +1260,7 @@ static CK_RV test_hss_priv_value_blocked(void* args)
     CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
     CK_ATTRIBUTE q;
 
-    ret = gen_hss_keys(session, &pub, &priv, 0);
+    ret = gen_hss_keys(session, &pub, &priv, 1);
     if (ret == CKR_OK) {
         /* Query length only. */
         q.type = CKA_VALUE;
@@ -1229,7 +1301,7 @@ static CK_RV test_hss_copy_priv_rejected(void* args)
     CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
     CK_OBJECT_HANDLE copy = CK_INVALID_HANDLE;
 
-    ret = gen_hss_keys(session, &pub, &priv, 0);
+    ret = gen_hss_keys(session, &pub, &priv, 1);
     if (ret == CKR_OK) {
         ret = funcList->C_CopyObject(session, priv, NULL, 0, &copy);
         /* Copy is rejected; exact CK_RV depends on internal mapping but
@@ -3069,6 +3141,7 @@ static TEST_FUNC testFunc[] = {
     PKCS11TEST_FUNC_SESS_DECL(test_hss_keys_remaining),
     PKCS11TEST_FUNC_SESS_DECL(test_hss_priv_value_blocked),
     PKCS11TEST_FUNC_SESS_DECL(test_hss_copy_priv_rejected),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_session_keygen_rejected),
 #  else
     PKCS11TEST_FUNC_SESS_DECL(test_hss_verify_only_no_keygen),
 #  endif

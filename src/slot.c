@@ -647,12 +647,14 @@ static CK_MECHANISM_INFO mldsaMechInfo = {
 };
 #endif
 #ifdef WOLFPKCS11_LMS
-/* HSS public-key sizes are small and parameter-dependent (RFC 8554). For
- * mechanism advertising we report a wide envelope: smallest L1/H5 ≈ 60 bytes,
- * largest L4/H25 ≈ 60 bytes (HSS pub is fixed-size for a given hash), so
- * pick a coarse envelope that fits all parameter combos. */
+/* HSS public-key sizes are fixed (RFC 8554, SHA256/M32 = 60 bytes regardless
+ * of parameters). PKCS#11 v3.2 does not define key-size semantics for HSS
+ * (bits vs bytes), so callers cannot reliably compare against this envelope.
+ * Report 0..0 to signal "not applicable" — the universal PKCS#11 convention
+ * for mechanisms whose key size is parameter-derived. Apps needing the exact
+ * key length can query CKA_VALUE_LEN on the public-key object. */
 static CK_MECHANISM_INFO hssMechInfo = {
-    60, 60,
+    0, 0,
     CKF_VERIFY
 #  ifdef WOLFPKCS11_LMS_PRIVATE
     | CKF_SIGN
@@ -660,7 +662,7 @@ static CK_MECHANISM_INFO hssMechInfo = {
 };
 #  ifdef WOLFPKCS11_LMS_PRIVATE
 static CK_MECHANISM_INFO hssKgMechInfo = {
-    60, 60, CKF_GENERATE_KEY_PAIR
+    0, 0, CKF_GENERATE_KEY_PAIR
 };
 #  endif
 #endif

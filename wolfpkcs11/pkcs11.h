@@ -178,7 +178,9 @@ extern "C" {
 #define CKK_HKDF                              0x00000042UL
 #define CKK_ML_KEM                            0x00000049UL
 #define CKK_ML_DSA                            0x0000004AUL
+#ifdef WOLFPKCS11_LMS
 #define CKK_HSS                               0x00000046UL
+#endif
 
 #ifdef WOLFPKCS11_NSS
 /* Not defined by NSS, but we need one */
@@ -263,6 +265,7 @@ extern "C" {
 /* KEM */
 #define CKA_ENCAPSULATE                       0x00000633UL
 #define CKA_DECAPSULATE                       0x00000634UL
+#ifdef WOLFPKCS11_LMS
 /* LMS/HSS (RFC 8554) */
 #define CKA_HSS_LEVELS                        0x00000617UL
 #define CKA_HSS_LMS_TYPE                      0x00000618UL
@@ -270,6 +273,7 @@ extern "C" {
 #define CKA_HSS_LMS_TYPES                     0x0000061AUL
 #define CKA_HSS_LMOTS_TYPES                   0x0000061BUL
 #define CKA_HSS_KEYS_REMAINING                0x0000061CUL
+#endif
 
 #ifdef WOLFPKCS11_NSS
 #define CKA_NSS_EMAIL                         (CKA_NSS + 2)
@@ -373,8 +377,10 @@ extern "C" {
 #define CKM_ML_DSA_KEY_PAIR_GEN               0x0000001CUL
 #define CKM_ML_DSA                            0x0000001DUL
 #define CKM_HASH_ML_DSA                       0x0000001FUL
+#ifdef WOLFPKCS11_LMS
 #define CKM_HSS_KEY_PAIR_GEN                  0x00004032UL
 #define CKM_HSS                               0x00004033UL
+#endif
 
 #ifdef WOLFPKCS11_NSS
 #define CKM_NSS_TLS_PRF_GENERAL_SHA256            (CKM_NSS + 21)
@@ -887,6 +893,7 @@ typedef CK_ULONG CK_ML_KEM_PARAMETER_SET_TYPE;
 #define CKP_ML_KEM_768         0x00000002UL
 #define CKP_ML_KEM_1024        0x00000003UL
 
+#ifdef WOLFPKCS11_LMS
 /* HSS / LMS / LMOTS algorithm identifiers (RFC 8554) used in CK_HSS_PARAMS. */
 typedef CK_ULONG CK_HSS_LEVELS;
 typedef CK_ULONG CK_LMS_TYPE;
@@ -905,17 +912,23 @@ typedef CK_ULONG CK_LMOTS_TYPE;
 #define CKL_LMOTS_SHA256_N32_W4    0x00000003UL
 #define CKL_LMOTS_SHA256_N32_W8    0x00000004UL
 
+/* Maximum number of HSS levels in the PKCS#11 wire struct. The struct stores
+ * fixed-size arrays; legitimate ulLevels MUST be <= CK_HSS_PARAMS_MAX_LEVELS,
+ * AND <= the wolfSSL build's WOLFSSL_LMS_MAX_LEVELS. The code validates both. */
+#define CK_HSS_PARAMS_MAX_LEVELS   8
+
 /* PKCS#11 v3.2 specifiedParams for CKM_HSS_KEY_PAIR_GEN. The `lm_type` and
- * `lm_ots_type` arrays carry one entry per HSS level (1..ulLevels-1 unused
- * entries are ignored). wolfSSL requires uniform (height, winternitz) across
- * levels in its current API; mixed parameters are rejected with
+ * `lm_ots_type` arrays carry one entry per HSS level (entries beyond
+ * ulLevels-1 are ignored). wolfSSL requires uniform (height, winternitz)
+ * across levels in its current API; mixed parameters are rejected with
  * CKR_MECHANISM_PARAM_INVALID. */
 typedef struct CK_HSS_PARAMS {
-    CK_HSS_LEVELS ulLevels;        /* 1..WOLFSSL_LMS_MAX_LEVELS */
-    CK_LMS_TYPE   lm_type[8];      /* per-level LMS typecode */
-    CK_LMOTS_TYPE lm_ots_type[8];  /* per-level LMOTS typecode */
+    CK_HSS_LEVELS ulLevels;                            /* 1..CK_HSS_PARAMS_MAX_LEVELS */
+    CK_LMS_TYPE   lm_type[CK_HSS_PARAMS_MAX_LEVELS];   /* per-level LMS typecode */
+    CK_LMOTS_TYPE lm_ots_type[CK_HSS_PARAMS_MAX_LEVELS]; /* per-level LMOTS typecode */
 } CK_HSS_PARAMS;
 typedef CK_HSS_PARAMS* CK_HSS_PARAMS_PTR;
+#endif /* WOLFPKCS11_LMS */
 
 
 /* Function list types. */
