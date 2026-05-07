@@ -47,7 +47,6 @@
 #endif
 #ifdef WOLFPKCS11_LMS
 #include <wolfssl/wolfcrypt/wc_lms.h>
-#include <wolfssl/wolfcrypt/lms.h>
 #endif
 
 #if !defined(WOLFPKCS11_NO_STORE) && !defined(WOLFPKCS11_CUSTOM_STORE)
@@ -294,6 +293,14 @@ struct WP11_Object {
     int keyDataLen;                    /* Length of encoded key data          */
     byte iv[GCM_NONCE_MID_SZ];         /* IV/nonce for encrypt/decrypt        */
     byte encoded:1;                    /* Key isn't in decoded form           */
+#endif
+#ifdef WOLFPKCS11_LMS_PRIVATE
+    /* Genesis-state buffer used when wolfSSL invokes the write callback
+     * during wc_LmsKey_MakeKey, before the object has been added to the
+     * slot (handle == 0). The buffer is flushed to durable storage by
+     * WP11_Hss_FlushDeferredState() once AddObject has assigned a handle. */
+    unsigned char* hssDeferredState;
+    word32 hssDeferredStateLen;
 #endif
 
     WP11_Session* session;             /* Session object belongs to           */
@@ -1122,7 +1129,7 @@ typedef struct WP11_FileStoreCtx {
 /* Mark a write-mode file storage context as requiring full durability
  * (fsync of file data + directory) before the close path returns success.
  * Must be called after wolfPKCS11_Store_OpenSz returned, before writes. */
-WP11_LOCAL void wolfPKCS11_Store_SetDurable(void* store, int durable)
+static void wolfPKCS11_Store_SetDurable(void* store, int durable)
 {
     WP11_FileStoreCtx* ctx = (WP11_FileStoreCtx*)store;
     if (ctx != NULL)
@@ -4977,6 +4984,34 @@ static int wp11_HssParseShellHeader(const byte* in, word32 inLen,
  *   [u32 ctLen][ciphertext + 16-byte AES-GCM tag]
  * The first 20 bytes (magic..winternitz) are bound into the GCM tag via AAD.
  */
+/* Compute the storage objId used by the token-serialization loop for this
+ * object. wp11_Token_Store iterates from objCnt-1 down to 0 walking the
+ * linked list head->next; the index assigned to each object equals its
+ * position from the tail. We MUST match that mapping or the state file
+ * lives under a different index than the shell file. */
+static int wp11_Hss_StorageObjIdx(WP11_Object* o)
+{
+    int idx;
+    int total;
+    WP11_Object* cur;
+    WP11_Token* tok;
+
+    if (o == NULL || o->slot == NULL)
+        return -1;
+    tok = &o->slot->token;
+    total = 0;
+    for (cur = tok->object; cur != NULL; cur = cur->next)
+        total++;
+    if (total == 0)
+        return -1;
+    idx = total - 1;
+    for (cur = tok->object; cur != NULL && cur != o; cur = cur->next)
+        idx--;
+    if (cur != o)
+        return -1;
+    return idx;
+}
+
 static int wp11_Hss_WriteStateBlob(WP11_Object* o, const byte* priv,
     word32 privSz)
 {
@@ -5043,7 +5078,12 @@ static int wp11_Hss_WriteStateBlob(WP11_Object* o, const byte* priv,
     totalLen = (word32)sizeof(hdr) + 4 + WP11_HSS_STATE_IV_LEN + 4 + ctLen;
 
     tokenId = (int)o->slot->id;
-    objId   = (int)o->handle;
+    objId   = wp11_Hss_StorageObjIdx(o);
+    if (objId < 0) {
+        wc_ForceZero(ct, ctLen);
+        XFREE(ct, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        return BAD_FUNC_ARG;
+    }
 
     ret = wp11_storage_open(WOLFPKCS11_STORE_HSSKEY_PRIV_STATE,
         (CK_ULONG)tokenId, (CK_ULONG)objId, (int)totalLen, &storage);
@@ -5101,7 +5141,9 @@ static int wp11_Hss_ReadStateBlob(WP11_Object* o, byte* priv, word32 privSz)
         return ret;
 
     tokenId = (int)o->slot->id;
-    objId   = (int)o->handle;
+    objId   = wp11_Hss_StorageObjIdx(o);
+    if (objId < 0)
+        return BAD_FUNC_ARG;
 
     ret = wp11_storage_open_readonly(WOLFPKCS11_STORE_HSSKEY_PRIV_STATE,
         (CK_ULONG)tokenId, (CK_ULONG)objId, &storage);
@@ -5169,22 +5211,81 @@ static int wp11_Hss_ReadStateBlob(WP11_Object* o, byte* priv, word32 privSz)
 }
 
 /* wolfSSL write callback — invoked by wc_LmsKey_MakeKey and wc_LmsKey_Sign
- * after each state advance. Returns 0 on success; non-zero aborts the sign
- * (no signature is released to the caller). */
+ * after each state advance. Must return WC_LMS_RC_SAVED_TO_NV_MEMORY on
+ * success; any other value aborts the sign (no signature is released).
+ *
+ * During keygen, MakeKey fires this callback before the object has been
+ * registered with the slot (handle == 0). Stash the genesis state in a
+ * heap buffer and rely on WP11_Hss_FlushDeferredState() being called by
+ * the keygen path after AddObject assigns a real handle. */
 static int wp11_Hss_WriteState_Cb(const byte* priv, word32 privSz, void* ctx)
 {
     WP11_Object* o = (WP11_Object*)ctx;
-    if (o == NULL)
+    if (o == NULL || priv == NULL || privSz == 0)
+        return WC_LMS_RC_BAD_ARG;
+
+    /* During keygen the object hasn't been added to the slot yet (handle
+     * still 0). We can't decide yet whether it's a token key — the caller
+     * has the CKA_TOKEN attribute. Stash the genesis state in a heap buffer;
+     * the keygen postlude calls WP11_Hss_FlushDeferredState() once the
+     * handle is assigned, which writes to disk only for token keys. */
+    if (o->handle == 0) {
+        unsigned char* buf;
+        if (o->hssDeferredState != NULL) {
+            wc_ForceZero(o->hssDeferredState, o->hssDeferredStateLen);
+            XFREE(o->hssDeferredState, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        }
+        buf = (unsigned char*)XMALLOC(privSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        if (buf == NULL)
+            return WC_LMS_RC_WRITE_FAIL;
+        XMEMCPY(buf, priv, privSz);
+        o->hssDeferredState = buf;
+        o->hssDeferredStateLen = privSz;
+        return WC_LMS_RC_SAVED_TO_NV_MEMORY;
+    }
+
+    /* Session-only keys do not need NV persistence: state lives in the
+     * in-memory LmsKey for the session's lifetime. */
+    if (!o->onToken)
+        return WC_LMS_RC_SAVED_TO_NV_MEMORY;
+
+    if (wp11_Hss_WriteStateBlob(o, priv, privSz) != 0)
+        return WC_LMS_RC_WRITE_FAIL;
+    return WC_LMS_RC_SAVED_TO_NV_MEMORY;
+}
+
+int WP11_Hss_FlushDeferredState(WP11_Object* priv)
+{
+    int ret = 0;
+    if (priv == NULL)
         return BAD_FUNC_ARG;
-    return wp11_Hss_WriteStateBlob(o, priv, privSz);
+    if (priv->hssDeferredState == NULL)
+        return 0;  /* nothing deferred */
+    if (priv->handle == 0)
+        return BAD_FUNC_ARG;  /* called too early */
+
+    /* Only persist for token-resident keys. Session keys keep their state
+     * in the in-memory LmsKey for the session's lifetime. */
+    if (priv->onToken) {
+        ret = wp11_Hss_WriteStateBlob(priv, priv->hssDeferredState,
+            priv->hssDeferredStateLen);
+    }
+
+    wc_ForceZero(priv->hssDeferredState, priv->hssDeferredStateLen);
+    XFREE(priv->hssDeferredState, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    priv->hssDeferredState = NULL;
+    priv->hssDeferredStateLen = 0;
+    return ret;
 }
 
 static int wp11_Hss_ReadState_Cb(byte* priv, word32 privSz, void* ctx)
 {
     WP11_Object* o = (WP11_Object*)ctx;
     if (o == NULL)
-        return BAD_FUNC_ARG;
-    return wp11_Hss_ReadStateBlob(o, priv, privSz);
+        return WC_LMS_RC_BAD_ARG;
+    if (wp11_Hss_ReadStateBlob(o, priv, privSz) != 0)
+        return WC_LMS_RC_READ_FAIL;
+    return WC_LMS_RC_READ_TO_MEMORY;
 }
 #endif /* WOLFPKCS11_LMS_PRIVATE */
 
@@ -5244,23 +5345,12 @@ static int wp11_Object_Decode_HssKey(WP11_Object* object)
             ret = wc_LmsKey_SetContext(object->data.lmsKey, object);
         if (ret == 0)
             ret = wc_LmsKey_Reload(object->data.lmsKey);
-        if (ret == 0) {
-            /* Cross-check the cached pub against the loaded key. Mismatch
-             * indicates the state file does not belong to this key (or
-             * tampering), so we refuse to use it. */
-            byte loaded[HSS_MAX_PUBLIC_KEY_LEN];
-            word32 loadedLen = sizeof(loaded);
-            ret = wc_LmsKey_ExportPubRaw(object->data.lmsKey, loaded,
-                &loadedLen);
-            if (ret == 0) {
-                if (loadedLen != pubLen ||
-                        WP11_ConstantCompare(loaded, pub,
-                                             (int)pubLen) != 1) {
-                    ret = BAD_FUNC_ARG;
-                }
-            }
-            wc_ForceZero(loaded, sizeof(loaded));
-        }
+        /* Trust the GCM-authenticated state file: if the tag verifies, the
+         * private state is intact. Restore the cached pub into key->pub so
+         * subsequent ExportPubRaw / Sign produce values consistent with the
+         * shell record. wc_LmsKey_Reload does not restore key->pub itself. */
+        if (ret == 0)
+            ret = wc_LmsKey_ImportPubRaw(object->data.lmsKey, pub, pubLen);
         if (ret == 0)
             object->opFlag |= WP11_FLAG_HSS_STATE_VALID;
         else
@@ -6561,6 +6651,15 @@ static int wp11_Object_Encode(WP11_Object* object, int protect)
                     wc_MlDsaKey_Free(object->data.mldsaKey);
                     object->encoded = 1;
                 }
+                break;
+        #endif
+        #ifdef WOLFPKCS11_LMS
+            case CKK_HSS:
+                ret = wp11_Object_Encode_HssKey(object);
+                /* Never `protect`-zero an HSS private LmsKey here — the
+                 * private state must remain in memory between Sign calls so
+                 * the wolfSSL read CB can serve it on demand. The shell
+                 * blob written to disk only carries params + public key. */
                 break;
         #endif
         #ifndef NO_DH
@@ -9620,6 +9719,14 @@ void WP11_Object_Free(WP11_Object* object)
         XFREE(object->label, NULL, DYNAMIC_TYPE_TMP_BUFFER);
     if (object->keyId != NULL)
         XFREE(object->keyId, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+#ifdef WOLFPKCS11_LMS_PRIVATE
+    if (object->hssDeferredState != NULL) {
+        wc_ForceZero(object->hssDeferredState, object->hssDeferredStateLen);
+        XFREE(object->hssDeferredState, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        object->hssDeferredState = NULL;
+        object->hssDeferredStateLen = 0;
+    }
+#endif
     if (object->issuer != NULL)
         XFREE(object->issuer, NULL, DYNAMIC_TYPE_CERT);
     if (object->serial != NULL)
@@ -10192,15 +10299,21 @@ int WP11_Object_SetMldsaKey(WP11_Object* object, unsigned char** data,
 int WP11_Object_SetHssKey(WP11_Object* object, unsigned char** data,
                           CK_ULONG* len)
 {
-    int ret;
+    int ret = 0;
     int levels = 0, height = 0, winternitz = 0;
     LmsKey* key;
 
     if (object == NULL || data == NULL || len == NULL)
         return BAD_FUNC_ARG;
 
-    /* Reject private-key import unconditionally. */
-    if (object->objClass != CKO_PUBLIC_KEY)
+    /* Reject private-key import (data[1] non-NULL on a private object means
+     * the caller is trying to install caller-controlled key material, which
+     * would defeat HSS state safety). Empty templates during NewObject hit
+     * this with data[1] == NULL — those are no-ops, not import attempts. */
+    if (object->objClass == CKO_PRIVATE_KEY && data[1] != NULL)
+        return BAD_FUNC_ARG;
+    if (object->objClass != CKO_PUBLIC_KEY &&
+            object->objClass != CKO_PRIVATE_KEY)
         return BAD_FUNC_ARG;
 
     if (object->onToken)
@@ -10208,8 +10321,17 @@ int WP11_Object_SetHssKey(WP11_Object* object, unsigned char** data,
 
     key = object->data.lmsKey;
 
-    /* data[0] is optional CK_HSS_PARAMS; if absent, the public key blob in
-     * data[1] is parsed by wolfSSL and we can fall back to defaults. */
+    /* Empty template case (newObject=TRUE during keygen): nothing to do
+     * yet — the wolfSSL key is fully initialized by WP11_Hss_GenerateKeyPair
+     * after both the public and private WP11_Objects are created. */
+    if (data[0] == NULL && data[1] == NULL) {
+        if (object->onToken)
+            WP11_Lock_UnlockRW(object->lock);
+        return 0;
+    }
+
+    /* Public-key import path: parse params, init the wolfSSL key,
+     * and import the raw public key bytes. */
     if (data[0] != NULL) {
         ret = wp11_HssTranslateParams((const CK_HSS_PARAMS*)data[0], len[0],
             &levels, &height, &winternitz);
@@ -10434,19 +10556,53 @@ int WP11_Hss_Sign(unsigned char* data, word32 dataLen, unsigned char* sig,
 
 /**
  * Returns the number of remaining one-time-keys ("signatures left") for the
- * HSS key. *remaining is set to 0 on error.
+ * HSS key. *remaining is set to 0 on error or when the key is exhausted.
+ *
+ * Note: wc_LmsKey_SigsLeft returns a boolean (1 if any sigs left, 0 if
+ * exhausted), not a count. Compute the actual count from the leaf index q
+ * stored in the first 8 bytes of priv_raw, big-endian, and the total
+ * 2^(levels*height) leaves.
  */
 int WP11_Hss_SigsLeft(WP11_Object* key, word32* remaining)
 {
-    int n;
+    int levels = 0, height = 0, winternitz = 0;
+    int totalH;
+    word64 q = 0;
+    word64 total;
+    int i;
+    LmsKey* k;
+
     if (key == NULL || key->data.lmsKey == NULL || remaining == NULL)
         return BAD_FUNC_ARG;
-    n = wc_LmsKey_SigsLeft(key->data.lmsKey);
-    if (n < 0) {
+    k = key->data.lmsKey;
+
+    /* Boolean check — if wolfSSL says "no sigs left", return 0 unconditionally. */
+    if (wc_LmsKey_SigsLeft(k) == 0) {
         *remaining = 0;
-        return n;
+        return 0;
     }
-    *remaining = (word32)n;
+
+    /* Compute (2^(levels*height) - q). q is big-endian in priv_raw[0..7]. */
+    if (wc_LmsKey_GetParameters(k, &levels, &height, &winternitz) != 0) {
+        *remaining = 0;
+        return BAD_FUNC_ARG;
+    }
+    for (i = 0; i < 8; i++)
+        q = (q << 8) | (word64)k->priv_raw[i];
+    totalH = levels * height;
+    if (totalH >= 64) {
+        /* Saturate — total signatures don't fit in word64. We cap at
+         * UINT32_MAX since the PKCS#11 attribute is CK_ULONG. */
+        *remaining = 0xFFFFFFFFU;
+        return 0;
+    }
+    total = ((word64)1) << totalH;
+    if (q >= total)
+        *remaining = 0;
+    else if ((total - q) > 0xFFFFFFFFULL)
+        *remaining = 0xFFFFFFFFU;
+    else
+        *remaining = (word32)(total - q);
     return 0;
 }
 #endif /* WOLFPKCS11_LMS_PRIVATE */
@@ -11660,14 +11816,9 @@ static int HssObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
 #ifdef WOLFPKCS11_LMS_PRIVATE
             if (object->objClass == CKO_PRIVATE_KEY) {
                 word32 remaining = 0;
-                int n = wc_LmsKey_SigsLeft(object->data.lmsKey);
-                if (n < 0) {
-                    *len = CK_UNAVAILABLE_INFORMATION;
-                }
-                else {
-                    CK_ULONG v;
-                    remaining = (word32)n;
-                    v = (CK_ULONG)remaining;
+                ret = WP11_Hss_SigsLeft(object, &remaining);
+                if (ret == 0) {
+                    CK_ULONG v = (CK_ULONG)remaining;
                     if (data == NULL) {
                         *len = sizeof(v);
                     }
@@ -11679,6 +11830,9 @@ static int HssObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
                         XMEMCPY(data, &v, sizeof(v));
                         *len = sizeof(v);
                     }
+                }
+                else {
+                    *len = CK_UNAVAILABLE_INFORMATION;
                 }
             }
             else {

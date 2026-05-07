@@ -599,6 +599,7 @@ WP11_LOCAL int WP11_Hss_Sign(unsigned char* data, word32 dataLen,
                              unsigned char* sig, word32* sigLen,
                              WP11_Object* priv);
 WP11_LOCAL int WP11_Hss_SigsLeft(WP11_Object* key, word32* remaining);
+WP11_LOCAL int WP11_Hss_FlushDeferredState(WP11_Object* priv);
 #endif
 
 WP11_LOCAL int WP11_Dh_GenerateKeyPair(WP11_Object* pub, WP11_Object* priv,

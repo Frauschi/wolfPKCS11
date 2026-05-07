@@ -39,6 +39,8 @@
     #include <wolfssl/options.h>
 #endif
 #include <wolfssl/wolfcrypt/settings.h>
+#include <wolfssl/wolfcrypt/types.h>
+#include <wolfssl/wolfcrypt/misc.h>
 
 #ifndef WOLFPKCS11_USER_SETTINGS
     #include <wolfpkcs11/options.h>
@@ -47,6 +49,9 @@
 
 #ifndef HAVE_PKCS11_STATIC
 #include <dlfcn.h>
+#ifndef WOLFPKCS11_DLL_FILENAME
+    #define WOLFPKCS11_DLL_FILENAME "src/.libs/libwolfpkcs11.so"
+#endif
 #endif
 
 #include <stdio.h>

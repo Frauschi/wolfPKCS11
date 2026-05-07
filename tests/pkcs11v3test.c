@@ -87,9 +87,13 @@ static byte* userPin = (byte*)"wolfpkcs11-test";
 static int userPinLen;
 
 #ifdef WOLFPKCS11_PKCS11_V3_2
-#if defined(WOLFPKCS11_MLDSA) || defined(WOLFPKCS11_MLKEM)
+#if defined(WOLFPKCS11_MLDSA) || defined(WOLFPKCS11_MLKEM) || \
+    defined(WOLFPKCS11_LMS)
 
 static CK_BBOOL ckTrue = CK_TRUE;
+
+#endif /* WOLFPKCS11_MLDSA || WOLFPKCS11_MLKEM || WOLFPKCS11_LMS */
+#if defined(WOLFPKCS11_MLDSA) || defined(WOLFPKCS11_MLKEM)
 static CK_OBJECT_CLASS privKeyClass = CKO_PRIVATE_KEY;
 static CK_OBJECT_CLASS pubKeyClass = CKO_PUBLIC_KEY;
 

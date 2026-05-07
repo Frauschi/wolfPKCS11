@@ -915,7 +915,7 @@ typedef struct CK_HSS_PARAMS {
     CK_LMS_TYPE   lm_type[8];      /* per-level LMS typecode */
     CK_LMOTS_TYPE lm_ots_type[8];  /* per-level LMOTS typecode */
 } CK_HSS_PARAMS;
-typedef CK_HSS_PARAMS CK_PTR CK_HSS_PARAMS_PTR;
+typedef CK_HSS_PARAMS* CK_HSS_PARAMS_PTR;
 
 
 /* Function list types. */

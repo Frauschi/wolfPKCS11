@@ -266,6 +266,14 @@ static AttributeType attrType[] = {
     { CKA_SEED,                        ATTR_TYPE_DATA  },
     { CKA_ENCAPSULATE,                 ATTR_TYPE_BOOL  },
     { CKA_DECAPSULATE,                 ATTR_TYPE_BOOL  },
+#ifdef WOLFPKCS11_LMS
+    { CKA_HSS_LEVELS,                  ATTR_TYPE_ULONG },
+    { CKA_HSS_LMS_TYPE,                ATTR_TYPE_ULONG },
+    { CKA_HSS_LMOTS_TYPE,              ATTR_TYPE_ULONG },
+    { CKA_HSS_LMS_TYPES,               ATTR_TYPE_DATA  },
+    { CKA_HSS_LMOTS_TYPES,             ATTR_TYPE_DATA  },
+    { CKA_HSS_KEYS_REMAINING,          ATTR_TYPE_ULONG },
+#endif
 #ifdef WOLFPKCS11_NSS
     { CKA_CERT_SHA1_HASH,              ATTR_TYPE_DATA  },
     { CKA_CERT_MD5_HASH,               ATTR_TYPE_DATA  },
@@ -7478,6 +7486,18 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
         rv = AddObject(session, priv, pPrivateKeyTemplate,
                                       ulPrivateKeyAttributeCount, phPrivateKey);
     }
+#ifdef WOLFPKCS11_LMS_PRIVATE
+    /* HSS keygen writes the genesis state via the wolfSSL write CB during
+     * MakeKey, BEFORE the object has a slot handle. The CB stashes those
+     * bytes; once AddObject has assigned the handle, flush them to the
+     * durable state file. If this fails, the keygen is rolled back: the
+     * object cannot be used to sign without a valid persisted state. */
+    if (rv == CKR_OK && priv != NULL && pMechanism != NULL &&
+            pMechanism->mechanism == CKM_HSS_KEY_PAIR_GEN) {
+        if (WP11_Hss_FlushDeferredState(priv) != 0)
+            rv = CKR_FUNCTION_FAILED;
+    }
+#endif
 
     if (pub != NULL && rv == CKR_OK) {
         rv = SetInitialStates(pub);
