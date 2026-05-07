@@ -7322,18 +7322,28 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
              * only HSS private key has no durable anchor for the leaf index;
              * a process crash between sign and cleanup releases a signature
              * whose OTS index was never persisted, allowing OTS-key reuse on
-             * the next invocation. Refuse session-only keys outright. */
+             * the next invocation. Refuse session-only keys outright.
+             *
+             * Distinguish a malformed CKA_TOKEN attribute (return
+             * CKR_ATTRIBUTE_VALUE_INVALID per PKCS#11 v3.2) from a well-formed
+             * but session-only template (return CKR_TEMPLATE_INCONSISTENT). */
             FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount,
                 CKA_TOKEN, &tokAttr);
-            if (tokAttr != NULL && tokAttr->pValue != NULL &&
-                    tokAttr->ulValueLen == sizeof(CK_BBOOL)) {
+            if (tokAttr != NULL) {
+                if (tokAttr->pValue == NULL ||
+                        tokAttr->ulValueLen != sizeof(CK_BBOOL)) {
+                    return CKR_ATTRIBUTE_VALUE_INVALID;
+                }
                 pubTok = *(CK_BBOOL*)tokAttr->pValue;
             }
             tokAttr = NULL;
             FindAttributeType(pPrivateKeyTemplate, ulPrivateKeyAttributeCount,
                 CKA_TOKEN, &tokAttr);
-            if (tokAttr != NULL && tokAttr->pValue != NULL &&
-                    tokAttr->ulValueLen == sizeof(CK_BBOOL)) {
+            if (tokAttr != NULL) {
+                if (tokAttr->pValue == NULL ||
+                        tokAttr->ulValueLen != sizeof(CK_BBOOL)) {
+                    return CKR_ATTRIBUTE_VALUE_INVALID;
+                }
                 privTok = *(CK_BBOOL*)tokAttr->pValue;
             }
             if (!pubTok || !privTok) {

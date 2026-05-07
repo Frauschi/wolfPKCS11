@@ -313,6 +313,14 @@ POSIX or `%APPDIR%\wolfPKCS11` on Windows), and finally the optional
 
 Set to any value to stop storage of token data.
 
+### WOLFPKCS11_STATEFUL_RELAX_FSYNC
+
+When set to `1`, skips the per-signature `fsync` calls used by stateful
+hash-based signature schemes (LMS/HSS today; XMSS in the future). **Never
+set this in production.** A power loss or kernel panic with this enabled
+can roll back the leaf-index advance and expose a one-time-key reuse
+window. See the LMS/HSS build section for details.
+
 
 ## Release Notes
 

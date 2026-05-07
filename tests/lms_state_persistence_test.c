@@ -332,7 +332,11 @@ static int corrupt_state_files(void)
         return -1;
     }
     while ((e = readdir(d)) != NULL) {
-        if (strstr(e->d_name, "state") == NULL)
+        /* Match the exact prefix of the HSS state file. Loose substring
+         * matching ("state") would also catch leftover *.tmp files from an
+         * interrupted commit and any future filename containing "state". */
+        if (strncmp(e->d_name, "wp11_hsskey_priv_state_",
+                    sizeof("wp11_hsskey_priv_state_") - 1) != 0)
             continue;
         {
             char path[512];
@@ -473,7 +477,10 @@ static CK_RV lms_state_persistence_test(void)
      *  (b) C_FindObjects: object is suppressed.
      *  (c) C_Sign: SignInit succeeds but Sign refuses (poison flag).
      * ANY of these constitutes a successful tamper-detection. The test
-     * MUST fail only if a Sign produces a signature with no error. */
+     * MUST fail only if a Sign produces a signature with no error. The
+     * "fail-fast at Login" path is the current implementation behavior
+     * (token-load eagerly reloads); the explicit Sign-refusal branch
+     * remains as a backstop in case a future change makes Login lazy. */
     {
         CK_RV initRet, sessRet;
         initRet = pkcs11_init();

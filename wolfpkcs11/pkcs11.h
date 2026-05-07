@@ -178,9 +178,10 @@ extern "C" {
 #define CKK_HKDF                              0x00000042UL
 #define CKK_ML_KEM                            0x00000049UL
 #define CKK_ML_DSA                            0x0000004AUL
-#ifdef WOLFPKCS11_LMS
+/* PKCS#11 v3.2 LMS/HSS key type. Exposed unconditionally; the library
+ * rejects the mechanism at runtime with CKR_MECHANISM_INVALID if it was
+ * built without WOLFPKCS11_LMS. */
 #define CKK_HSS                               0x00000046UL
-#endif
 
 #ifdef WOLFPKCS11_NSS
 /* Not defined by NSS, but we need one */
@@ -265,15 +266,13 @@ extern "C" {
 /* KEM */
 #define CKA_ENCAPSULATE                       0x00000633UL
 #define CKA_DECAPSULATE                       0x00000634UL
-#ifdef WOLFPKCS11_LMS
-/* LMS/HSS (RFC 8554) */
+/* LMS/HSS (RFC 8554). Exposed unconditionally — see comment on CKK_HSS. */
 #define CKA_HSS_LEVELS                        0x00000617UL
 #define CKA_HSS_LMS_TYPE                      0x00000618UL
 #define CKA_HSS_LMOTS_TYPE                    0x00000619UL
 #define CKA_HSS_LMS_TYPES                     0x0000061AUL
 #define CKA_HSS_LMOTS_TYPES                   0x0000061BUL
 #define CKA_HSS_KEYS_REMAINING                0x0000061CUL
-#endif
 
 #ifdef WOLFPKCS11_NSS
 #define CKA_NSS_EMAIL                         (CKA_NSS + 2)
@@ -377,10 +376,9 @@ extern "C" {
 #define CKM_ML_DSA_KEY_PAIR_GEN               0x0000001CUL
 #define CKM_ML_DSA                            0x0000001DUL
 #define CKM_HASH_ML_DSA                       0x0000001FUL
-#ifdef WOLFPKCS11_LMS
+/* LMS/HSS mechanisms (RFC 8554). Exposed unconditionally — see CKK_HSS. */
 #define CKM_HSS_KEY_PAIR_GEN                  0x00004032UL
 #define CKM_HSS                               0x00004033UL
-#endif
 
 #ifdef WOLFPKCS11_NSS
 #define CKM_NSS_TLS_PRF_GENERAL_SHA256            (CKM_NSS + 21)
@@ -893,8 +891,13 @@ typedef CK_ULONG CK_ML_KEM_PARAMETER_SET_TYPE;
 #define CKP_ML_KEM_768         0x00000002UL
 #define CKP_ML_KEM_1024        0x00000003UL
 
-#ifdef WOLFPKCS11_LMS
-/* HSS / LMS / LMOTS algorithm identifiers (RFC 8554) used in CK_HSS_PARAMS. */
+/* HSS / LMS / LMOTS algorithm identifiers (RFC 8554) used in CK_HSS_PARAMS.
+ *
+ * These typedefs and the CK_HSS_PARAMS struct are exposed unconditionally
+ * so a downstream consumer that includes <wolfpkcs11/pkcs11.h> compiles
+ * regardless of whether the wolfPKCS11 library was built with
+ * WOLFPKCS11_LMS. If the library is built without HSS support, the
+ * mechanism is rejected at runtime with CKR_MECHANISM_INVALID. */
 typedef CK_ULONG CK_HSS_LEVELS;
 typedef CK_ULONG CK_LMS_TYPE;
 typedef CK_ULONG CK_LMOTS_TYPE;
@@ -928,7 +931,6 @@ typedef struct CK_HSS_PARAMS {
     CK_LMOTS_TYPE lm_ots_type[CK_HSS_PARAMS_MAX_LEVELS]; /* per-level LMOTS typecode */
 } CK_HSS_PARAMS;
 typedef CK_HSS_PARAMS* CK_HSS_PARAMS_PTR;
-#endif /* WOLFPKCS11_LMS */
 
 
 /* Function list types. */
