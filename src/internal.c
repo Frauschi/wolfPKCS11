@@ -1792,24 +1792,30 @@ int wolfPKCS11_Store_Open(int type, CK_ULONG id1, CK_ULONG id2, int read,
  *
  * @param [in]  store  Context for operation.
  */
-void wolfPKCS11_Store_Close(void* store)
+/* Internal close-and-report helper. Returns 0 on a successful close+commit,
+ * non-zero if the temp-file rename or fsync failed. The legacy
+ * wolfPKCS11_Store_Close wrapper discards this status to preserve its void
+ * signature; durability-sensitive callers (the HSS state-write path) must
+ * use the *_CloseAndReport entrypoint and propagate failures. */
+static int wolfPKCS11_Store_CloseAndReport(void* store)
 {
 #ifdef WOLFPKCS11_TPM_STORE
     WP11_TpmStore* tpmStore = (WP11_TpmStore*)store;
 #else
     WP11_FileStoreCtx* ctx = (WP11_FileStoreCtx*)store;
 #endif
+    int ret = 0;
 
 #ifdef WOLFPKCS11_DEBUG_STORE
     printf("Store close: %p\n", store);
 #endif
 
 #ifdef WOLFPKCS11_TPM_STORE
-    /* nothing to do for TPM */
     (void)tpmStore;
 #else
     if (ctx != NULL) {
         int commitRet = 0;
+        int fsyncFailed = 0;
 
         if (ctx->file != XBADFILE && ctx->file != NULL) {
             /* Durable mode: flush file data to disk before close so the
@@ -1819,12 +1825,14 @@ void wolfPKCS11_Store_Close(void* store)
 #if defined(_WIN32) || defined(_MSC_VER)
                 {
                     int fd = _fileno(ctx->file);
-                    if (fd >= 0) (void)_commit(fd);
+                    if (fd < 0 || _commit(fd) != 0)
+                        fsyncFailed = 1;
                 }
 #else
                 {
                     int fd = fileno(ctx->file);
-                    if (fd >= 0) (void)fsync(fd);
+                    if (fd < 0 || fsync(fd) != 0)
+                        fsyncFailed = 1;
                 }
 #endif
             }
@@ -1840,16 +1848,26 @@ void wolfPKCS11_Store_Close(void* store)
                 printf("Store commit failed for %s (ret %d)\n",
                     ctx->final_name, commitRet);
 #endif
+                ret = commitRet;
             }
         }
         else if (ctx->has_temp) {
             wolfPKCS11_StoreAbortTemp(ctx);
         }
 
+        if (ret == 0 && fsyncFailed)
+            ret = READ_ONLY_E;
+
         XMEMSET(ctx, 0, sizeof(*ctx));
         XFREE(ctx, NULL, DYNAMIC_TYPE_TMP_BUFFER);
     }
 #endif
+    return ret;
+}
+
+void wolfPKCS11_Store_Close(void* store)
+{
+    (void)wolfPKCS11_Store_CloseAndReport(store);
 }
 
 /**
@@ -5110,7 +5128,15 @@ static int wp11_Hss_WriteStateBlob(WP11_Object* o, const byte* priv,
         }
         if (ret == 0)
             ret = wp11_storage_write(storage, ct, (int)ctLen);
-        wp11_storage_close(storage);
+        /* Capture the close-and-commit result. A void close would mask
+         * a failed rename/fsync; that would let wc_LmsKey_Sign release a
+         * signature whose state advance never reached durable storage,
+         * causing OTS-key reuse on the next process restart. */
+        {
+            int closeRet = wolfPKCS11_Store_CloseAndReport(storage);
+            if (ret == 0)
+                ret = closeRet;
+        }
     }
 
     wc_ForceZero(ct, ctLen);
@@ -5265,10 +5291,17 @@ int WP11_Hss_FlushDeferredState(WP11_Object* priv)
         return BAD_FUNC_ARG;  /* called too early */
 
     /* Only persist for token-resident keys. Session keys keep their state
-     * in the in-memory LmsKey for the session's lifetime. */
+     * in the in-memory LmsKey for the session's lifetime.
+     *
+     * WriteStateBlob walks the token's object list to compute the storage
+     * idx, so the token lock must be held for the duration of the walk and
+     * the disk write. priv->lock points at &token->lock for token objects
+     * (set by WP11_Session_AddObject). */
     if (priv->onToken) {
+        WP11_Lock_LockRW(priv->lock);
         ret = wp11_Hss_WriteStateBlob(priv, priv->hssDeferredState,
             priv->hssDeferredStateLen);
+        WP11_Lock_UnlockRW(priv->lock);
     }
 
     wc_ForceZero(priv->hssDeferredState, priv->hssDeferredStateLen);
