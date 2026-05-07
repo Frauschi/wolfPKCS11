@@ -134,9 +134,10 @@ The default parameter set when none is supplied is `levels = 1`,
 because the underlying wolfSSL API requires uniform parameters.
 
 For non-production rigs (e.g., tmpfs-backed test harnesses) the env var
-`WOLFPKCS11_HSS_RELAX_FSYNC=1` skips the per-signature `fsync` calls.
-**Never set this in production.** A power loss or kernel panic can then
-expose a one-time-key reuse window.
+`WOLFPKCS11_STATEFUL_RELAX_FSYNC=1` skips the per-signature `fsync` calls.
+The variable applies to all stateful hash-based signature schemes
+(LMS/HSS today; XMSS in the future). **Never set this in production.** A
+power loss or kernel panic can then expose a one-time-key reuse window.
 
 ### Build options and defines
 

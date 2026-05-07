@@ -145,6 +145,21 @@ C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT"
        (HSS state files are too large for TPM NV).
 #endif
 
+/* WOLFPKCS11_STATEFUL_SIG_ANY is defined when any stateful hash-based
+ * signature scheme is enabled (verify-only OR sign-capable). Today: LMS/HSS;
+ * future: XMSS, XMSS^MT. Gates the shared shell/byte utilities. */
+#if defined(WOLFPKCS11_LMS)
+#define WOLFPKCS11_STATEFUL_SIG_ANY
+#endif
+
+/* WOLFPKCS11_STATEFUL_SIG_PRIVATE is defined when any stateful hash-based
+ * signature scheme with sign + keygen support is enabled. Gates the
+ * encrypted-state-file infrastructure (wp11_Stateful_*StateBlob, env-var
+ * fsync gate, poison flag) — none of which is needed for verify-only. */
+#if defined(WOLFPKCS11_LMS_PRIVATE)
+#define WOLFPKCS11_STATEFUL_SIG_PRIVATE
+#endif
+
 /* We need the next two for NSS, just for storage, even if we have no algos */
 #ifndef WC_MD5_DIGEST_SIZE
 #define WC_MD5_DIGEST_SIZE 16
@@ -246,11 +261,12 @@ C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT"
 #define WP11_FLAG_DERIVE               0x00040000
 #define WP11_FLAG_ENCAPSULATE          0x00080000
 #define WP11_FLAG_DECAPSULATE          0x00100000
-/* Internal poison/reload marker for HSS private keys. Set after a successful
- * keygen or wc_LmsKey_Reload; cleared on any state-write failure or sign
- * error. When clear, signing is refused with CKR_DEVICE_ERROR until the key
- * is reloaded from durable storage. */
-#define WP11_FLAG_HSS_STATE_VALID      0x00200000
+/* Internal poison/reload marker for stateful-signature private keys (LMS/HSS
+ * today; XMSS/XMSS^MT in the future). Set after a successful keygen or
+ * wolfSSL Reload; cleared on any state-write failure or sign error. When
+ * clear, signing is refused with CKR_DEVICE_ERROR until the key is reloaded
+ * from durable storage. */
+#define WP11_FLAG_STATEFUL_STATE_VALID 0x00200000
 
 /* Flags for token. */
 #define WP11_TOKEN_FLAG_USER_PIN_SET   0x00000001
