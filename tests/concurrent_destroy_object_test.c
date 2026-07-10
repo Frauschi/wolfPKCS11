@@ -41,6 +41,7 @@
 #endif
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #ifndef WOLFSSL_USER_SETTINGS
     #include <wolfssl/options.h>

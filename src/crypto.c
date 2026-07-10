@@ -1280,7 +1280,7 @@ err_out:
         if (*phKey != CK_INVALID_HANDLE) {
             /* ignore return value, logged in function */
             (void)WP11_Session_RemoveObject(session, privKeyObject,
-                                            WP11_Object_OnToken(privKeyObject));
+                                            WP11_Object_OnToken(privKeyObject), 0);
             *phKey = CK_INVALID_HANDLE;
         }
         if (privKeyObject != NULL) {
@@ -1478,7 +1478,7 @@ CK_RV C_CreateObject(CK_SESSION_HANDLE hSession, CK_ATTRIBUTE_PTR pTemplate,
     if (rv != CKR_OK) {
         /* ignore return value, logged in function */
         (void)WP11_Session_RemoveObject(session, object,
-                                        WP11_Object_OnToken(object));
+                                        WP11_Object_OnToken(object), 0);
         WP11_Object_Free(object);
     }
 
@@ -1708,16 +1708,12 @@ CK_RV C_DestroyObject(CK_SESSION_HANDLE hSession,
         return rv;
     }
 
-    /* Reject destruction of objects whose CKA_DESTROYABLE has been set to
-     * CK_FALSE. Read the flag bit directly so the gate stays consistent
-     * regardless of which getter view applies. */
-    if (!WP11_Object_IsDestroyable(obj)) {
-        rv = CKR_ACTION_PROHIBITED;
-        WOLFPKCS11_LEAVE("C_DestroyObject", rv);
-        return rv;
-    }
-
-    ret = WP11_Session_RemoveObject(session, obj, onToken);
+    /* Remove and reject-if-not-destroyable in one locked step. The
+     * CKA_DESTROYABLE check is performed inside WP11_Session_RemoveObject, once
+     * the object is confirmed still linked (and therefore alive), so it cannot
+     * race a concurrent free of the same handle. */
+    ret = WP11_Session_RemoveObject(session, obj, onToken,
+                                    1 /* checkDestroyable */);
     if (ret == WP11_OBJECT_ALREADY_REMOVED) {
         /* Another thread destroyed this object first (a concurrent
          * C_DestroyObject on the same shared token-object handle). That thread
@@ -1726,12 +1722,20 @@ CK_RV C_DestroyObject(CK_SESSION_HANDLE hSession,
         WOLFPKCS11_LEAVE("C_DestroyObject", rv);
         return rv;
     }
+    if (ret == WP11_OBJECT_NOT_DESTROYABLE) {
+        /* CKA_DESTROYABLE is CK_FALSE; object left in place. */
+        rv = CKR_ACTION_PROHIBITED;
+        WOLFPKCS11_LEAVE("C_DestroyObject", rv);
+        return rv;
+    }
     /* Drop any active-operation reference to this object before freeing it so a
      * pending operation cannot use freed memory. */
     WP11_Slot_ClearActiveObject(WP11_Session_GetSlot(session), obj);
     WP11_Object_Free(obj);
 
-    rv = CKR_OK;
+    /* The object was unlinked; a negative status means persisting the token
+     * afterwards failed. Surface it rather than reporting success. */
+    rv = (ret < 0) ? CKR_FUNCTION_FAILED : CKR_OK;
     WOLFPKCS11_LEAVE("C_DestroyObject", rv);
     return rv;
 }
@@ -7933,13 +7937,13 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
     if (rv != CKR_OK && pub != NULL) {
         if (*phPublicKey != CK_INVALID_HANDLE)
             (void)WP11_Session_RemoveObject(session, pub,
-                                            WP11_Object_OnToken(pub));
+                                            WP11_Object_OnToken(pub), 0);
         WP11_Object_Free(pub);
     }
     if (rv != CKR_OK && priv != NULL) {
         if (*phPrivateKey != CK_INVALID_HANDLE)
             (void)WP11_Session_RemoveObject(session, priv,
-                                            WP11_Object_OnToken(priv));
+                                            WP11_Object_OnToken(priv), 0);
         WP11_Object_Free(priv);
     }
 
@@ -8438,7 +8442,7 @@ CK_RV C_UnwrapKey(CK_SESSION_HANDLE hSession,
                 if (*phKey != CK_INVALID_HANDLE) {
                     /* ignore return value, logged in function */
                     (void)WP11_Session_RemoveObject(session, keyObj,
-                                                    WP11_Object_OnToken(keyObj));
+                                                    WP11_Object_OnToken(keyObj), 0);
                     *phKey = CK_INVALID_HANDLE;
                 }
                 if (keyObj != NULL) {
