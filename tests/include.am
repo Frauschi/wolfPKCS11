@@ -240,6 +240,11 @@ noinst_PROGRAMS += tests/tpm_decode_bounds_test
 tests_tpm_decode_bounds_test_SOURCES = tests/tpm_decode_bounds_test.c
 tests_tpm_decode_bounds_test_LDADD =
 
+check_PROGRAMS += tests/concurrent_destroy_object_test
+noinst_PROGRAMS += tests/concurrent_destroy_object_test
+tests_concurrent_destroy_object_test_SOURCES = tests/concurrent_destroy_object_test.c
+tests_concurrent_destroy_object_test_LDADD =
+
 if BUILD_STATIC
 tests_pkcs11test_LDADD += src/libwolfpkcs11.la
 tests_pkcs11mtt_LDADD  += src/libwolfpkcs11.la
@@ -289,6 +294,7 @@ tests_aes_keywrap_pad_test_LDADD += src/libwolfpkcs11.la
 tests_mlkem_secret_scrub_test_LDADD += src/libwolfpkcs11.la
 tests_logout_token_key_zero_test_LDADD += src/libwolfpkcs11.la
 tests_tpm_decode_bounds_test_LDADD += src/libwolfpkcs11.la
+tests_concurrent_destroy_object_test_LDADD += src/libwolfpkcs11.la
 else
 tests_object_id_uniqueness_test_LDADD += src/libwolfpkcs11.la
 tests_empty_pin_store_test_LDADD += src/libwolfpkcs11.la
@@ -330,6 +336,7 @@ tests_aes_keywrap_pad_test_LDADD += src/libwolfpkcs11.la
 tests_mlkem_secret_scrub_test_LDADD += src/libwolfpkcs11.la
 tests_logout_token_key_zero_test_LDADD += src/libwolfpkcs11.la
 tests_tpm_decode_bounds_test_LDADD += src/libwolfpkcs11.la
+tests_concurrent_destroy_object_test_LDADD += src/libwolfpkcs11.la
 endif
 
 EXTRA_DIST += tests/unit.h \

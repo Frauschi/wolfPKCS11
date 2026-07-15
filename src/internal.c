@@ -922,7 +922,7 @@ static void wp11_Session_Final(WP11_Session* session)
         /* Free objects in session. */
         while ((obj = session->object) != NULL) {
             /* ignore return value, logged in function */
-            (void)WP11_Session_RemoveObject(session, obj);
+            WP11_Session_RemoveObject(session, obj);
             WP11_Object_Free(obj);
         }
         session->inUse = 0;
@@ -8815,51 +8815,122 @@ int WP11_Session_AddObject(WP11_Session* session, int onToken,
 }
 
 /**
- * Remove object to the session or token.
+ * Remove an object from its session or token list, addressing it by a
+ * caller-supplied onToken flag rather than by dereferencing the object.
  *
- * @param  session  [in]  Session object.
- * @param  object   [in]  Key Object object.
- * @return  -ve on failure.
- *          0 on success.
+ * Membership is established by pointer identity alone, so *object is never
+ * dereferenced until it is confirmed still linked (and therefore still alive).
+ * onToken must be derived from the handle (see WP11_Object_HandleOnToken), not
+ * from *object, so it stays valid even after a concurrent caller frees the
+ * object. This is the entry point for C_DestroyObject, where a second thread may
+ * be destroying the same shared token-object handle at the same time.
+ *
+ * Callers that hold the only reference to a live object should use the simpler
+ * WP11_Session_RemoveObject() wrapper instead: it derives onToken from the
+ * object itself and so cannot mismatch onToken against the wrong object.
+ *
+ * @param  session          [in]  Session performing the removal.
+ * @param  object           [in]  Object to remove, matched by pointer identity.
+ * @param  onToken          [in]  Non-zero if the handle names a token object.
+ *                                Derive from the handle, never from *object.
+ * @param  checkDestroyable [in]  Non-zero to honor CKA_DESTROYABLE and refuse to
+ *                                remove an object marked not destroyable.
+ * @return  WP11_OBJECT_ALREADY_REMOVED if the object was no longer linked, i.e.
+ *          a concurrent caller already removed it; the caller must not free it.
+ *          WP11_OBJECT_NOT_DESTROYABLE if checkDestroyable is set and the object
+ *          has CKA_DESTROYABLE = CK_FALSE; the object is left in place and must
+ *          not be freed.
+ *          -ve on a store failure after the object was unlinked.
+ *          0 on success; the caller now owns the object and must free it.
  */
-int WP11_Session_RemoveObject(WP11_Session* session, WP11_Object* object)
+int WP11_Session_RemoveObjectByHandle(WP11_Session* session,
+                                      WP11_Object* object, int onToken,
+                                      int checkDestroyable)
 {
     int ret = 0;
+    int found = 0;
     WP11_Object** curr;
-    WP11_Token* token;
-    int id;
+    WP11_Token* token = &session->slot->token;
+    WP11_Session* owner = session;
+    int id = 0;
 
+    /* The token lock guards every object list on the slot (session lists
+     * included). Take it before touching any list or the object. Token objects
+     * are shared across sessions, so two C_DestroyObject calls on the same
+     * handle can both pass the lock-free WP11_Object_Find and reach here with
+     * the same pointer; the loser must detect that the winner already unlinked
+     * (and is about to free) the object and bail out without a second free.
+     *
+     * Membership is established by pointer identity alone so that *object is
+     * never dereferenced until it is confirmed still linked (and therefore
+     * still alive). onToken comes from the handle, not from *object, so it is
+     * safe to trust even after the object has been freed. */
+    WP11_Lock_LockRW(&token->lock);
+
+    if (onToken) {
+        /* Token objects live on the shared token list. */
+        for (curr = &token->object; *curr != NULL; curr = &(*curr)->next) {
+            if (*curr == object) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    else {
+        /* Session objects live on their owning session's list. Check the
+         * caller's own list first: it is the only possibility in the standard
+         * build and the common case under NSS, and needs no dereference of
+         * *object. */
+        for (curr = &owner->object; *curr != NULL; curr = &(*curr)->next) {
+            if (*curr == object) {
+                found = 1;
+                break;
+            }
+        }
 #ifdef WOLFPKCS11_NSS
-    if (object->session && (session != object->session))
-        session = object->session;
+        /* NSS makes objects visible across sessions, so the object may belong
+         * to a different session. Fall back to its recorded owner. This is
+         * reached only for a genuinely cross-session object - a freed object is
+         * normally caught as not-found above - and carries the same
+         * out-of-contract residual as a single-session concurrent misuse. */
+        if (!found && object->session != NULL && object->session != session) {
+            owner = object->session;
+            for (curr = &owner->object; *curr != NULL; curr = &(*curr)->next) {
+                if (*curr == object) {
+                    found = 1;
+                    break;
+                }
+            }
+        }
 #endif
+    }
 
-    /* Find the object in list and relink. */
-    if (object->onToken) {
-        WP11_Lock_LockRW(object->lock);
-        token = &session->slot->token;
+    if (!found) {
+        WP11_Lock_UnlockRW(&token->lock);
+        return WP11_OBJECT_ALREADY_REMOVED;
+    }
+
+    /* The object is confirmed linked, and therefore alive, so its fields may
+     * now be read safely under the lock. Enforce CKA_DESTROYABLE here rather
+     * than in the caller so the check cannot race a concurrent free. */
+    if (checkDestroyable && (object->opFlag & WP11_FLAG_NOT_DESTROYABLE)) {
+        WP11_Lock_UnlockRW(&token->lock);
+        return WP11_OBJECT_NOT_DESTROYABLE;
+    }
+
+    if (onToken) {
         token->objCnt--;
         /* Id of first object on token. */
         id = token->objCnt;
         curr = &token->object;
-    }
-    else {
-        session->objCnt--;
-        /* Id of first object in session. */
-        id = session->objCnt;
-        curr = &session->object;
-        WP11_Lock_LockRW(&session->slot->token.lock);
-    }
+        /* walk list to get id for object to remove */
+        while (*curr != NULL) {
+            if (*curr == object) {
+                *curr = object->next;
+                break;
+            }
 
-    /* walk list to get id for object to remove */
-    while (*curr != NULL) {
-        if (*curr == object) {
-            *curr = object->next;
-            break;
-        }
-
-    #ifndef WOLFPKCS11_NO_STORE
-        if (object->onToken) {
+        #ifndef WOLFPKCS11_NO_STORE
             /* remove any id's with higher value */
             ret = wp11_Object_Unstore(*curr, (int)session->slotId, id);
         #ifdef DEBUG_WOLFPKCS11
@@ -8868,16 +8939,14 @@ int WP11_Session_RemoveObject(WP11_Session* session, WP11_Object* object)
                     (int)session->slotId, id, ret);
             }
         #endif
+        #endif
+
+            curr = &(*curr)->next;
+            /* Id of next object as it isn't the one being removed. */
+            id--;
         }
-    #endif
 
-        curr = &(*curr)->next;
-        /* Id of next object as it isn't the one being removed. */
-        id--;
-    }
-
-    if (object->onToken) {
-#ifndef WOLFPKCS11_NO_STORE
+    #ifndef WOLFPKCS11_NO_STORE
         ret = wp11_Object_Unstore(object, (int)session->slotId, id);
     #ifdef DEBUG_WOLFPKCS11
         if (ret != 0) {
@@ -8893,14 +8962,40 @@ int WP11_Session_RemoveObject(WP11_Session* session, WP11_Object* object)
                 (int)session->slotId, ret);
         }
     #endif
-#endif
-        WP11_Lock_UnlockRW(object->lock);
+    #endif
     }
     else {
-        WP11_Lock_UnlockRW(&session->slot->token.lock);
+        owner->objCnt--;
+        for (curr = &owner->object; *curr != NULL; curr = &(*curr)->next) {
+            if (*curr == object) {
+                *curr = object->next;
+                break;
+            }
+        }
     }
+
+    WP11_Lock_UnlockRW(&token->lock);
     (void)id; /* set but not used with WOLFPKCS11_NO_STORE */
     return ret;
+}
+
+/**
+ * Remove a live, exclusively-owned object from its session or token list.
+ *
+ * Thin wrapper over WP11_Session_RemoveObjectByHandle() for cleanup paths that
+ * hold the only reference to the object (object-creation rollback, keygen
+ * failure). onToken is read from the object itself, which is safe because no
+ * other thread can be removing it, and supplying onToken this way removes any
+ * risk of passing the wrong object's onToken. CKA_DESTROYABLE is not enforced
+ * (internal cleanup is not a user destroy) and any store error is logged in the
+ * callee, so the return value is intentionally discarded.
+ *
+ * @param  session  [in]  Session performing the removal.
+ * @param  object   [in]  Object to remove; must be live and owned by the caller.
+ */
+void WP11_Session_RemoveObject(WP11_Session* session, WP11_Object* object)
+{
+    (void)WP11_Session_RemoveObjectByHandle(session, object, object->onToken, 0);
 }
 
 /**
@@ -10198,6 +10293,22 @@ int WP11_Object_SetClass(WP11_Object* object, CK_OBJECT_CLASS objClass)
 }
 
 /**
+ * Determine whether an object handle refers to a token object.
+ *
+ * The onToken bit is encoded in the handle value itself, so this is safe to
+ * call even when the WP11_Object has already been freed by another thread -
+ * useful when deciding which list a racing C_DestroyObject must consult.
+ *
+ * @param  handle  [in]  Object handle.
+ * @return  1 when the handle refers to a token object.
+ *          0 when the handle refers to a session object.
+ */
+int WP11_Object_HandleOnToken(CK_OBJECT_HANDLE handle)
+{
+    return OBJ_HANDLE_ON_TOKEN(handle);
+}
+
+/**
  * Find an object based on the handle.
  *
  * @param  session    [in]   Session object.
@@ -10221,13 +10332,13 @@ int WP11_Object_Find(WP11_Session* session, CK_OBJECT_HANDLE objHandle,
         /* The NSS cross-session walk below needs the slot lock so a concurrent
          * remove-session can't reclaim a session node. Acquire it before the
          * token lock to match the global lock order (slot then token) used by
-         * WP11_Session_RemoveObject / WP11_Slot_CloseSessions; acquiring them
-         * in the opposite order would risk an AB-BA deadlock. */
+         * WP11_Session_RemoveObjectByHandle / WP11_Slot_CloseSessions; acquiring
+         * them in the opposite order would risk an AB-BA deadlock. */
         WP11_Lock_LockRO(&session->slot->lock);
 #endif
         /* Hold the token lock across the session->object walk so a concurrent
-         * WP11_Session_RemoveObject (which holds the same lock around the
-         * unlink) can't free a node we're stepping through. */
+         * WP11_Session_RemoveObjectByHandle (which holds the same lock around
+         * the unlink) can't free a node we're stepping through. */
         WP11_Lock_LockRO(&session->slot->token.lock);
         obj = session->object;
         while (obj != NULL) {

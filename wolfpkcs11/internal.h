@@ -441,7 +441,22 @@ WP11_LOCAL int WP11_Session_SetMldsaParams(WP11_Session* session, CK_VOID_PTR pa
                                            CK_ULONG paramsLen);
 WP11_LOCAL int WP11_Session_AddObject(WP11_Session* session, int onToken,
                            WP11_Object* object);
-WP11_LOCAL int WP11_Session_RemoveObject(WP11_Session* session, WP11_Object* object);
+/* Returned by WP11_Session_RemoveObjectByHandle when the object was no longer
+ * linked, i.e. a concurrent caller (e.g. a second C_DestroyObject on the same
+ * shared token-object handle) already removed it. A positive value, distinct
+ * from the 0 / negative store-status codes returned on a successful removal. The
+ * caller must not free the object a second time. */
+#define WP11_OBJECT_ALREADY_REMOVED 1
+/* Returned by WP11_Session_RemoveObjectByHandle (only when checkDestroyable is
+ * set) when the object is still linked but has CKA_DESTROYABLE = CK_FALSE. The
+ * object is left in place and must not be freed. */
+#define WP11_OBJECT_NOT_DESTROYABLE 2
+WP11_LOCAL int WP11_Session_RemoveObjectByHandle(WP11_Session* session,
+                              WP11_Object* object, int onToken,
+                              int checkDestroyable);
+WP11_LOCAL void WP11_Session_RemoveObject(WP11_Session* session,
+                              WP11_Object* object);
+WP11_LOCAL int WP11_Object_HandleOnToken(CK_OBJECT_HANDLE handle);
 WP11_LOCAL void WP11_Slot_ClearActiveObject(WP11_Slot* slot,
                                             WP11_Object* object);
 WP11_LOCAL void WP11_Session_GetObject(WP11_Session* session, WP11_Object** object);

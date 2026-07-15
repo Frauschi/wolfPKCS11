@@ -1278,8 +1278,7 @@ static CK_RV AddRSAPrivateKeyObject(WP11_Session* session,
 err_out:
     if (rv != CKR_OK) {
         if (*phKey != CK_INVALID_HANDLE) {
-            /* ignore return value, logged in function */
-            (void)WP11_Session_RemoveObject(session, privKeyObject);
+            WP11_Session_RemoveObject(session, privKeyObject);
             *phKey = CK_INVALID_HANDLE;
         }
         if (privKeyObject != NULL) {
@@ -1475,8 +1474,7 @@ CK_RV C_CreateObject(CK_SESSION_HANDLE hSession, CK_ATTRIBUTE_PTR pTemplate,
     }
     rv = AddObject(session, object, pTemplate, ulCount, phObject);
     if (rv != CKR_OK) {
-        /* ignore return value, logged in function */
-        (void)WP11_Session_RemoveObject(session, object);
+        WP11_Session_RemoveObject(session, object);
         WP11_Object_Free(object);
     }
 
@@ -1664,6 +1662,7 @@ CK_RV C_DestroyObject(CK_SESSION_HANDLE hSession,
                       CK_OBJECT_HANDLE hObject)
 {
     int ret;
+    int onToken;
     CK_RV rv;
     WP11_Session* session;
     WP11_Object* obj = NULL;
@@ -1692,29 +1691,47 @@ CK_RV C_DestroyObject(CK_SESSION_HANDLE hSession,
         WOLFPKCS11_LEAVE("C_DestroyObject", rv);
         return rv;
     }
+    /* Derive onToken from the handle, not the object: it stays valid even if a
+     * concurrent destroy of the same handle frees the object out from under
+     * us, and it lets WP11_Session_RemoveObjectByHandle unlink token objects
+     * using pointer identity alone. */
+    onToken = WP11_Object_HandleOnToken(hObject);
 
     /* Only require R/W session for token objects */
-    if (!WP11_Session_IsRW(session) && WP11_Object_OnToken(obj)) {
+    if (!WP11_Session_IsRW(session) && onToken) {
         rv = CKR_SESSION_READ_ONLY;
         WOLFPKCS11_LEAVE("C_DestroyObject", rv);
         return rv;
     }
 
-    /* Reject destruction of objects whose CKA_DESTROYABLE has been set to
-     * CK_FALSE. Read the flag bit directly so the gate stays consistent
-     * regardless of which getter view applies. */
-    if (!WP11_Object_IsDestroyable(obj)) {
+    /* Remove and reject-if-not-destroyable in one locked step. The
+     * CKA_DESTROYABLE check is performed inside WP11_Session_RemoveObjectByHandle,
+     * once the object is confirmed still linked (and therefore alive), so it
+     * cannot race a concurrent free of the same handle. */
+    ret = WP11_Session_RemoveObjectByHandle(session, obj, onToken,
+                                            1 /* checkDestroyable */);
+    if (ret == WP11_OBJECT_ALREADY_REMOVED) {
+        /* Another thread destroyed this object first (a concurrent
+         * C_DestroyObject on the same shared token-object handle). That thread
+         * owns the free; do not touch the object again. */
+        rv = CKR_OBJECT_HANDLE_INVALID;
+        WOLFPKCS11_LEAVE("C_DestroyObject", rv);
+        return rv;
+    }
+    if (ret == WP11_OBJECT_NOT_DESTROYABLE) {
+        /* CKA_DESTROYABLE is CK_FALSE; object left in place. */
         rv = CKR_ACTION_PROHIBITED;
         WOLFPKCS11_LEAVE("C_DestroyObject", rv);
         return rv;
     }
-
-    rv = WP11_Session_RemoveObject(session, obj);
     /* Drop any active-operation reference to this object before freeing it so a
      * pending operation cannot use freed memory. */
     WP11_Slot_ClearActiveObject(WP11_Session_GetSlot(session), obj);
     WP11_Object_Free(obj);
 
+    /* The object was unlinked; a negative status means persisting the token
+     * afterwards failed. Surface it rather than reporting success. */
+    rv = (ret < 0) ? CKR_FUNCTION_FAILED : CKR_OK;
     WOLFPKCS11_LEAVE("C_DestroyObject", rv);
     return rv;
 }
@@ -7915,12 +7932,12 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
 
     if (rv != CKR_OK && pub != NULL) {
         if (*phPublicKey != CK_INVALID_HANDLE)
-            (void)WP11_Session_RemoveObject(session, pub);
+            WP11_Session_RemoveObject(session, pub);
         WP11_Object_Free(pub);
     }
     if (rv != CKR_OK && priv != NULL) {
         if (*phPrivateKey != CK_INVALID_HANDLE)
-            (void)WP11_Session_RemoveObject(session, priv);
+            WP11_Session_RemoveObject(session, priv);
         WP11_Object_Free(priv);
     }
 
@@ -8417,8 +8434,7 @@ CK_RV C_UnwrapKey(CK_SESSION_HANDLE hSession,
             }
             if (rv != CKR_OK) {
                 if (*phKey != CK_INVALID_HANDLE) {
-                    /* ignore return value, logged in function */
-                    (void)WP11_Session_RemoveObject(session, keyObj);
+                    WP11_Session_RemoveObject(session, keyObj);
                     *phKey = CK_INVALID_HANDLE;
                 }
                 if (keyObj != NULL) {
