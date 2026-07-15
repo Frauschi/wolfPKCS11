@@ -110,6 +110,22 @@ jobs:
     uses: ./.github/workflows/build-workflow.yml
     with:
       config: --enable-mlkem
+  lms:
+    uses: ./.github/workflows/build-workflow.yml
+    with:
+      config: --enable-lms
+  xmss:
+    uses: ./.github/workflows/build-workflow.yml
+    with:
+      config: --enable-xmss
+  lms_xmss:
+    uses: ./.github/workflows/build-workflow.yml
+    with:
+      config: --enable-lms --enable-xmss
+  lms_xmss_static:
+    uses: ./.github/workflows/build-workflow.yml
+    with:
+      config: --enable-lms --enable-xmss --disable-shared
   debug:
     uses: ./.github/workflows/build-workflow.yml
     with:

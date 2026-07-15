@@ -178,6 +178,9 @@ extern "C" {
 #define CKK_AES                               0x0000001FUL
 #define CKK_DES3                              0x00000015UL /* not supported */
 #define CKK_HKDF                              0x00000042UL
+#define CKK_HSS                               0x00000046UL
+#define CKK_XMSS                              0x00000047UL
+#define CKK_XMSSMT                            0x00000048UL
 #define CKK_ML_KEM                            0x00000049UL
 #define CKK_ML_DSA                            0x0000004AUL
 
@@ -264,6 +267,13 @@ extern "C" {
 /* KEM */
 #define CKA_ENCAPSULATE                       0x00000633UL
 #define CKA_DECAPSULATE                       0x00000634UL
+/* LMS/HSS (RFC 8554) */
+#define CKA_HSS_LEVELS                        0x00000617UL
+#define CKA_HSS_LMS_TYPE                      0x00000618UL
+#define CKA_HSS_LMOTS_TYPE                    0x00000619UL
+#define CKA_HSS_LMS_TYPES                     0x0000061AUL
+#define CKA_HSS_LMOTS_TYPES                   0x0000061BUL
+#define CKA_HSS_KEYS_REMAINING                0x0000061CUL
 
 #ifdef WOLFPKCS11_NSS
 #define CKA_NSS_EMAIL                         (CKA_NSS + 2)
@@ -367,6 +377,14 @@ extern "C" {
 #define CKM_ML_DSA_KEY_PAIR_GEN               0x0000001CUL
 #define CKM_ML_DSA                            0x0000001DUL
 #define CKM_HASH_ML_DSA                       0x0000001FUL
+/* Stateful hash-based signature mechanisms (RFC 8554 HSS, RFC 8391 XMSS /
+ * XMSS^MT). */
+#define CKM_HSS_KEY_PAIR_GEN                  0x00004032UL
+#define CKM_HSS                               0x00004033UL
+#define CKM_XMSS_KEY_PAIR_GEN                 0x00004034UL
+#define CKM_XMSSMT_KEY_PAIR_GEN               0x00004035UL
+#define CKM_XMSS                              0x00004036UL
+#define CKM_XMSSMT                            0x00004037UL
 
 #ifdef WOLFPKCS11_NSS
 #define CKM_NSS_TLS_PRF_GENERAL_SHA256            (CKM_NSS + 21)
@@ -878,6 +896,32 @@ typedef CK_ULONG CK_ML_KEM_PARAMETER_SET_TYPE;
 #define CKP_ML_KEM_512         0x00000001UL
 #define CKP_ML_KEM_768         0x00000002UL
 #define CKP_ML_KEM_1024        0x00000003UL
+
+/* HSS / LMS / LMOTS algorithm identifiers (RFC 8554). The HSS key parameters
+ * are carried by the CKA_HSS_LEVELS / CKA_HSS_LMS_TYPE(S) / CKA_HSS_LMOTS_TYPE(S)
+ * key attributes (PKCS#11 v3.3 HSS profile). */
+typedef CK_ULONG CK_HSS_LEVELS;
+typedef CK_ULONG CK_LMS_TYPE;
+typedef CK_ULONG CK_LMOTS_TYPE;
+
+/* RFC 8554 LMS typecodes (subset supported by wolfSSL) */
+#define CKL_LMS_SHA256_M32_H5      0x00000005UL
+#define CKL_LMS_SHA256_M32_H10     0x00000006UL
+#define CKL_LMS_SHA256_M32_H15     0x00000007UL
+#define CKL_LMS_SHA256_M32_H20     0x00000008UL
+#define CKL_LMS_SHA256_M32_H25     0x00000009UL
+
+/* RFC 8554 LMOTS typecodes (subset supported by wolfSSL) */
+#define CKL_LMOTS_SHA256_N32_W1    0x00000001UL
+#define CKL_LMOTS_SHA256_N32_W2    0x00000002UL
+#define CKL_LMOTS_SHA256_N32_W4    0x00000003UL
+#define CKL_LMOTS_SHA256_N32_W8    0x00000004UL
+
+/* XMSS / XMSS^MT parameter-set identifier types (PKCS#11 v3.3). The value is
+ * the numeric algorithm OID (per NIST SP800-208), also carried in the leading
+ * 4 bytes of the public key. */
+typedef CK_ULONG CK_XMSS_PARAMETER_SET_TYPE;
+typedef CK_ULONG CK_XMSSMT_PARAMETER_SET_TYPE;
 
 
 /* Function list types. */
