@@ -566,6 +566,65 @@ then
     AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_MLKEM"
 fi
 
+# LMS/HSS (RFC 8554) verification and public-key import. Requires wolfSSL
+# built with --enable-lms (WOLFSSL_HAVE_LMS). Sign/keygen are a separate,
+# later feature; this flag provides verify + public-key import only.
+AC_ARG_ENABLE([lms],
+    [AS_HELP_STRING([--enable-lms],[Enable LMS/HSS verification and public-key import (default: disabled)])],
+    [ ENABLED_LMS=$enableval ],
+    [ ENABLED_LMS=no ]
+    )
+
+if test "$ENABLED_SHA256" = "no"
+then
+    if test "$ENABLED_LMS" = "yes"; then
+        echo "LMS/HSS requires SHA-256 support (disabled), disabling LMS/HSS"
+    fi
+    ENABLED_LMS=no
+fi
+
+if test "$ENABLED_LMS" = "yes"
+then
+    if test "$ENABLED_PKCS11V3_2" = "no"; then
+        ENABLED_PKCS11V3_2=yes
+        AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_2"
+        if test "$ENABLED_PKCS11V3_0" = "no"; then
+            ENABLED_PKCS11V3_0=yes
+            AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_0"
+        fi
+    fi
+    AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_LMS"
+fi
+
+# XMSS/XMSS^MT (RFC 8391) verification and public-key import. Requires wolfSSL
+# built with --enable-xmss (WOLFSSL_HAVE_XMSS). Verify + public-key import only.
+AC_ARG_ENABLE([xmss],
+    [AS_HELP_STRING([--enable-xmss],[Enable XMSS/XMSS^MT verification and public-key import (default: disabled)])],
+    [ ENABLED_XMSS=$enableval ],
+    [ ENABLED_XMSS=no ]
+    )
+
+if test "$ENABLED_SHA256" = "no"
+then
+    if test "$ENABLED_XMSS" = "yes"; then
+        echo "XMSS requires SHA-256 support (disabled), disabling XMSS"
+    fi
+    ENABLED_XMSS=no
+fi
+
+if test "$ENABLED_XMSS" = "yes"
+then
+    if test "$ENABLED_PKCS11V3_2" = "no"; then
+        ENABLED_PKCS11V3_2=yes
+        AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_2"
+        if test "$ENABLED_PKCS11V3_0" = "no"; then
+            ENABLED_PKCS11V3_0=yes
+            AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_0"
+        fi
+    fi
+    AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_XMSS"
+fi
+
 
 AM_CONDITIONAL([BUILD_STATIC],[test "x$enable_shared" = "xno"])
 
@@ -755,6 +814,8 @@ echo "   * ECC:                        $ENABLED_ECC"
 echo "   * HKDF:                       $ENABLED_HKDF"
 echo "   * ML-DSA:                     $ENABLED_MLDSA"
 echo "   * ML-KEM:                     $ENABLED_MLKEM"
+echo "   * LMS/HSS verify:             $ENABLED_LMS"
+echo "   * XMSS/XMSS^MT verify:        $ENABLED_XMSS"
 echo "   * NSS modifications:          $ENABLED_NSS"
 echo "   * Default token path:         $WOLFPKCS11_DEFAULT_TOKEN_PATH"
 echo "   * PKCS#11 Version 3.0:        $ENABLED_PKCS11V3_0"

@@ -40,6 +40,12 @@
 #define WOLFPKCS11_STORE_MLDSAKEY_PUB   0x0D
 #define WOLFPKCS11_STORE_MLKEMKEY_PRIV  0x0E
 #define WOLFPKCS11_STORE_MLKEMKEY_PUB   0x0F
+/* Stateful hash-based signature keys. The private-key storage types (0x10 for
+ * HSS, 0x12 for XMSS) are reserved for the future sign-capable builds so each
+ * priv/pub pair stays adjacent and ordered private-before-public like the
+ * other algorithms above. */
+#define WOLFPKCS11_STORE_HSSKEY_PUB     0x11
+#define WOLFPKCS11_STORE_XMSSKEY_PUB    0x13
 
 /*
  * Opens access to location to read/write token data.

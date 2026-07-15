@@ -266,6 +266,12 @@ struct WP11_Object {
     #ifdef WOLFPKCS11_MLKEM
         MlKemKey* mlKemKey;            /* ML-KEM key object                   */
     #endif
+    #ifdef WOLFPKCS11_LMS
+        LmsKey* lmsKey;                /* LMS/HSS key object (verify)         */
+    #endif
+    #ifdef WOLFPKCS11_XMSS
+        XmssKey* xmssKey;              /* XMSS/XMSS^MT key object (verify)    */
+    #endif
         WP11_Data* symmKey;            /* Symmetric key object                */
         WP11_GenericData genericData;  /* Generic data object                 */
         WP11_Cert cert;                /* Certificate object                  */
@@ -1477,6 +1483,18 @@ static int wolfPKCS11_Store_Name(int type, CK_ULONG id1, CK_ULONG id2, char* nam
                     str, id1, id2);
             break;
 #endif
+#ifdef WOLFPKCS11_LMS
+        case WOLFPKCS11_STORE_HSSKEY_PUB:
+            ret = XSNPRINTF(name, nameLen, "%s/wp11_hsskey_pub_%016lx_%016lx",
+                    str, id1, id2);
+            break;
+#endif
+#ifdef WOLFPKCS11_XMSS
+        case WOLFPKCS11_STORE_XMSSKEY_PUB:
+            ret = XSNPRINTF(name, nameLen, "%s/wp11_xmsskey_pub_%016lx_%016lx",
+                    str, id1, id2);
+            break;
+#endif
 
         default:
             ret = -1;
@@ -2575,6 +2593,35 @@ int wp11_Object_AllocateTypeData(WP11_Object* object)
                 }
                 break;
             #endif
+            #ifdef WOLFPKCS11_LMS
+            case CKK_HSS:
+                if (object->data.lmsKey == NULL) {
+                    object->data.lmsKey = (LmsKey*)XMALLOC(
+                        sizeof(LmsKey), NULL, DYNAMIC_TYPE_KEY);
+                    if (object->data.lmsKey == NULL) {
+                        ret = MEMORY_E;
+                    }
+                    else {
+                        XMEMSET(object->data.lmsKey, 0, sizeof(LmsKey));
+                    }
+                }
+                break;
+            #endif
+            #ifdef WOLFPKCS11_XMSS
+            case CKK_XMSS:
+            case CKK_XMSSMT:
+                if (object->data.xmssKey == NULL) {
+                    object->data.xmssKey = (XmssKey*)XMALLOC(
+                        sizeof(XmssKey), NULL, DYNAMIC_TYPE_KEY);
+                    if (object->data.xmssKey == NULL) {
+                        ret = MEMORY_E;
+                    }
+                    else {
+                        XMEMSET(object->data.xmssKey, 0, sizeof(XmssKey));
+                    }
+                }
+                break;
+            #endif
             #ifndef NO_DH
             case CKK_DH:
                 if (object->data.dhKey == NULL) {
@@ -3055,6 +3102,21 @@ int WP11_Object_Copy(WP11_Object *src, WP11_Object *dest)
 #endif
 #ifndef NO_DH
                 case CKK_DH:
+                    return BAD_FUNC_ARG;
+#endif
+#ifdef WOLFPKCS11_LMS
+                case CKK_HSS:
+#endif
+#ifdef WOLFPKCS11_XMSS
+                case CKK_XMSS:
+                case CKK_XMSSMT:
+#endif
+#if defined(WOLFPKCS11_LMS) || defined(WOLFPKCS11_XMSS)
+                    /* Copying is prohibited for all LMS/XMSS keys. Public keys
+                     * carry no secret state, but future sign-capable builds add
+                     * private keys whose one-time signature state must never be
+                     * duplicated; rejecting every HBS key copy keeps that
+                     * invariant uniform across key classes. */
                     return BAD_FUNC_ARG;
 #endif
 #ifndef NO_AES
@@ -5234,6 +5296,761 @@ static int wp11_Object_Store_MlKemKey(WP11_Object* object, int tokenId,
 }
 #endif /* WOLFPKCS11_MLKEM */
 
+#ifdef WOLFPKCS11_LMS
+/* ===========================================================================
+ * LMS/HSS (RFC 8554): verification and public-key import.
+ *
+ * Verify-only: this build imports raw HSS public keys and verifies
+ * signatures. There is no private-key/keygen/sign or persisted signature
+ * state here. The public key is self-describing, so wolfSSL derives the
+ * parameter set from the key bytes on import; the CKA_HSS_LEVELS /
+ * CKA_HSS_LMS_TYPE / CKA_HSS_LMOTS_TYPE attributes are optional and, when
+ * supplied, are validated against the imported key.
+ * ========================================================================= */
+
+/* Map tree height -> RFC 8554 LMS typecode. Returns 0 on unknown height. */
+static CK_LMS_TYPE wp11_HssHeightToLmsType(int h)
+{
+    switch (h) {
+        case 5:  return CKL_LMS_SHA256_M32_H5;
+        case 10: return CKL_LMS_SHA256_M32_H10;
+        case 15: return CKL_LMS_SHA256_M32_H15;
+        case 20: return CKL_LMS_SHA256_M32_H20;
+        case 25: return CKL_LMS_SHA256_M32_H25;
+        default: return 0;
+    }
+}
+
+/* Map Winternitz -> LMOTS typecode. Returns 0 on unknown. */
+static CK_LMOTS_TYPE wp11_HssWToLmotsType(int w)
+{
+    switch (w) {
+        case 1: return CKL_LMOTS_SHA256_N32_W1;
+        case 2: return CKL_LMOTS_SHA256_N32_W2;
+        case 4: return CKL_LMOTS_SHA256_N32_W4;
+        case 8: return CKL_LMOTS_SHA256_N32_W8;
+        default: return 0;
+    }
+}
+
+/* Import a raw HSS public key into the given wolfSSL LmsKey. wolfSSL derives
+ * the parameter set from the key bytes (RFC 8554 self-describing public key),
+ * so no parameters need to be set first. On failure the (partially
+ * initialized) key is NOT freed here; the caller owns it. */
+static int wp11_HssImportPub(LmsKey* key, int devId, const byte* pub,
+    word32 pubLen)
+{
+    int ret;
+
+    ret = wc_LmsKey_Init(key, NULL, devId);
+    if (ret == 0)
+        ret = wc_LmsKey_ImportPubRaw(key, pub, pubLen);
+    return ret;
+}
+
+/* Validate caller-supplied HSS parameter attributes against the parameters
+ * wolfSSL derived from the just-imported public key. Per the PKCS#11 v3.3 HSS
+ * profile the public-key parameters are the individual CK_ULONG attributes
+ * CKA_HSS_LEVELS, CKA_HSS_LMS_TYPE (top-level tree height encoding) and
+ * CKA_HSS_LMOTS_TYPE (Winternitz encoding). Each is optional; a supplied value
+ * that does not match the key is rejected with BAD_FUNC_ARG. levelsAttr,
+ * lmsAttr and lmotsAttr are the raw attribute buffers (NULL when absent) with
+ * lengths levelsLen/lmsLen/lmotsLen. */
+static int wp11_HssCheckParamAttrs(LmsKey* key,
+    const byte* levelsAttr, word32 levelsLen,
+    const byte* lmsAttr, word32 lmsLen,
+    const byte* lmotsAttr, word32 lmotsLen)
+{
+    int ret, levels = 0, height = 0, winternitz = 0;
+    CK_ULONG v;
+
+    ret = wc_LmsKey_GetParameters(key, &levels, &height, &winternitz);
+    if (ret != 0)
+        return ret;
+    if (levelsAttr != NULL) {
+        if (levelsLen != sizeof(v))
+            return BAD_FUNC_ARG;
+        XMEMCPY(&v, levelsAttr, sizeof(v));
+        if (v != (CK_ULONG)levels)
+            return BAD_FUNC_ARG;
+    }
+    if (lmsAttr != NULL) {
+        if (lmsLen != sizeof(v))
+            return BAD_FUNC_ARG;
+        XMEMCPY(&v, lmsAttr, sizeof(v));
+        if (v != (CK_ULONG)wp11_HssHeightToLmsType(height))
+            return BAD_FUNC_ARG;
+    }
+    if (lmotsAttr != NULL) {
+        if (lmotsLen != sizeof(v))
+            return BAD_FUNC_ARG;
+        XMEMCPY(&v, lmotsAttr, sizeof(v));
+        if (v != (CK_ULONG)wp11_HssWToLmotsType(winternitz))
+            return BAD_FUNC_ARG;
+    }
+    return 0;
+}
+
+/* Serialize the public key: keyData holds the raw RFC 8554 HSS public key. */
+static int wp11_Object_Encode_HssKey(WP11_Object* object)
+{
+    int ret;
+    word32 pubLen = 0;
+
+    if (object->objClass != CKO_PUBLIC_KEY)
+        return NOT_AVAILABLE_E;  /* verify-only: no private-key objects */
+
+    ret = wc_LmsKey_GetPubLen(object->data.lmsKey, &pubLen);
+    if (ret == 0) {
+        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        object->keyData = (unsigned char*)XMALLOC(pubLen, NULL,
+            DYNAMIC_TYPE_TMP_BUFFER);
+        if (object->keyData == NULL)
+            ret = MEMORY_E;
+    }
+    if (ret == 0) {
+        ret = wc_LmsKey_ExportPubRaw(object->data.lmsKey, object->keyData,
+            &pubLen);
+        if (ret == 0)
+            object->keyDataLen = (int)pubLen;
+    }
+    return ret;
+}
+
+/* Reconstruct the live wolfSSL key from the serialized public key in keyData. */
+static int wp11_Object_Decode_HssKey(WP11_Object* object)
+{
+    int ret;
+
+    if (object->objClass != CKO_PUBLIC_KEY)
+        return NOT_AVAILABLE_E;
+
+    /* Reload from the stored raw public key; wolfSSL re-derives the parameter
+     * set from the key bytes (no separate parameters are persisted). */
+    ret = wp11_HssImportPub(object->data.lmsKey, object->devId,
+        object->keyData, (word32)object->keyDataLen);
+    /* The object owns the live key on all paths (the import helper never frees
+     * it), so encoded stays 0 for WP11_Object_Free to do the single free. */
+    object->encoded = 0;
+    return ret;
+}
+
+static int wp11_Object_Load_HssKey(WP11_Object* object, int tokenId, int objId)
+{
+    int ret;
+    void* storage = NULL;
+
+    ret = wp11_storage_open_readonly(WOLFPKCS11_STORE_HSSKEY_PUB, tokenId,
+        objId, &storage);
+    if (ret == 0) {
+        ret = wp11_storage_read_alloc_array(storage, &object->keyData,
+            &object->keyDataLen);
+        wp11_storage_close(storage);
+    }
+    return ret;
+}
+
+static int wp11_Object_Store_HssKey(WP11_Object* object, int tokenId, int objId)
+{
+    int ret = 0;
+    void* storage = NULL;
+
+    if (object->keyData == NULL)
+        ret = wp11_Object_Encode_HssKey(object);
+    if (ret == 0)
+        ret = wp11_storage_open(WOLFPKCS11_STORE_HSSKEY_PUB, tokenId, objId,
+            object->keyDataLen, &storage);
+    if (ret == 0) {
+        ret = wp11_storage_write_array(storage, object->keyData,
+            object->keyDataLen);
+        wp11_storage_close(storage);
+    }
+    return ret;
+}
+
+/* Import an HSS public key from a C_CreateObject template. Following the
+ * PKCS#11 v3.3 HSS profile the collected attributes are data[0]=CKA_HSS_LEVELS,
+ * data[1]=CKA_HSS_LMS_TYPE, data[2]=CKA_HSS_LMOTS_TYPE (all optional CK_ULONG)
+ * and data[3]=CKA_VALUE, the raw RFC 8554 public key. wolfSSL derives the
+ * parameter set from the key bytes; any supplied CKA_HSS_* attribute is
+ * validated against the derived parameters and a mismatch is rejected.
+ * Private-key import is rejected: caller-supplied stateful private material is
+ * a forgery vector and out of scope for verify-only support. */
+int WP11_Object_SetHssKey(WP11_Object* object, unsigned char** data,
+                          CK_ULONG* len)
+{
+    int ret = 0;
+    LmsKey* newKey = NULL;
+
+    if (object == NULL || data == NULL || len == NULL)
+        return BAD_FUNC_ARG;
+    if (object->objClass != CKO_PUBLIC_KEY)
+        return BAD_FUNC_ARG;
+    /* A public key must carry its value. There is no keygen path in a
+     * verify-only build that would populate it later, so an absent
+     * CKA_VALUE is an incomplete template rather than a deferred import;
+     * reject it instead of creating an unusable object. */
+    if (data[3] == NULL)
+        return BAD_FUNC_ARG;
+
+    if (object->onToken)
+        WP11_Lock_LockRW(object->lock);
+
+    /* Import into a temporary key and swap it in only after it fully validates,
+     * so a failed re-import (C_SetAttributeValue with a new CKA_VALUE) leaves
+     * the existing key unchanged as PKCS#11 requires. */
+    newKey = (LmsKey*)XMALLOC(sizeof(LmsKey), NULL, DYNAMIC_TYPE_KEY);
+    if (newKey == NULL)
+        ret = MEMORY_E;
+    if (ret == 0) {
+        XMEMSET(newKey, 0, sizeof(LmsKey));
+        ret = wp11_HssImportPub(newKey, object->devId, data[3],
+            (word32)len[3]);
+    }
+    if (ret == 0) {
+        ret = wp11_HssCheckParamAttrs(newKey, data[0], (word32)len[0],
+            data[1], (word32)len[1], data[2], (word32)len[2]);
+    }
+    if (ret == 0) {
+        /* Replace the live key and drop the cached serialization so a later
+         * store re-encodes from the new key instead of persisting stale bytes. */
+        if (object->data.lmsKey != NULL) {
+            if (!object->encoded)
+                wc_LmsKey_Free(object->data.lmsKey);
+            XFREE(object->data.lmsKey, NULL, DYNAMIC_TYPE_KEY);
+        }
+        object->data.lmsKey = newKey;
+        object->encoded = 0;
+        newKey = NULL;
+        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        object->keyData = NULL;
+        object->keyDataLen = 0;
+    }
+    if (newKey != NULL) {
+        wc_LmsKey_Free(newKey);
+        XFREE(newKey, NULL, DYNAMIC_TYPE_KEY);
+    }
+
+    if (object->onToken)
+        WP11_Lock_UnlockRW(object->lock);
+    return ret;
+}
+
+/* Verify an HSS signature over a raw message. Stateless on the verifier. */
+int WP11_Hss_Verify(unsigned char* sig, word32 sigLen, unsigned char* data,
+                    word32 dataLen, int* stat, WP11_Object* pub)
+{
+    int ret;
+    word32 expSigLen = 0;
+
+    if (pub == NULL || pub->data.lmsKey == NULL || stat == NULL)
+        return BAD_FUNC_ARG;
+
+    /* Verification only reads the key: wc_LmsKey_Verify works from a locally
+     * allocated LmsState, so a shared RO lock is safe for concurrent verifies
+     * on the same token object. */
+    if (pub->onToken)
+        WP11_Lock_LockRO(pub->lock);
+
+    /* A signature whose length does not match the key's parameter set cannot
+     * be valid; report it as an invalid signature (stat = 0 ->
+     * CKR_SIGNATURE_INVALID) rather than letting wolfSSL's length check
+     * surface as a function failure. */
+    if (wc_LmsKey_GetSigLen(pub->data.lmsKey, &expSigLen) == 0 &&
+            sigLen != expSigLen) {
+        *stat = 0;
+        ret = 0;
+    }
+    else {
+        /* Unlike XMSS, whose wolfSSL verify rejects a zero-length message with
+         * BAD_FUNC_ARG, wc_LmsKey_Verify accepts an empty message, so HSS needs
+         * no dataLen == 0 special-case here (see WP11_Xmss_Verify). */
+        ret = wc_LmsKey_Verify(pub->data.lmsKey, sig, sigLen, data,
+            (int)dataLen);
+        /* Only a genuine verification mismatch (SIG_VERIFY_E) maps to stat=0.
+         * Remaining argument/state errors surface as a function failure so
+         * they are not silently reported as an invalid signature. */
+        if (ret == 0) {
+            *stat = 1;
+        }
+        else if (ret == SIG_VERIFY_E) {
+            *stat = 0;
+            ret = 0;
+        }
+        else {
+            *stat = 0;
+        }
+    }
+
+    if (pub->onToken)
+        WP11_Lock_UnlockRO(pub->lock);
+
+    return ret;
+}
+
+/* Serve HSS-specific attributes from a public-key object. */
+static int HssObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
+                             byte* data, CK_ULONG* len)
+{
+    int ret = 0;
+    int levels = 0, height = 0, winternitz = 0;
+
+    if (object == NULL || object->data.lmsKey == NULL || len == NULL)
+        return BAD_FUNC_ARG;
+
+    switch (type) {
+        case CKA_HSS_LEVELS: {
+            CK_ULONG v;
+            ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels,
+                &height, &winternitz);
+            if (ret == 0) {
+                v = (CK_ULONG)levels;
+                if (data == NULL)
+                    *len = sizeof(v);
+                else if (*len < sizeof(v)) {
+                    *len = sizeof(v);
+                    ret = BUFFER_E;
+                }
+                else {
+                    XMEMCPY(data, &v, sizeof(v));
+                    *len = sizeof(v);
+                }
+            }
+            break;
+        }
+        case CKA_HSS_LMS_TYPE: {
+            CK_LMS_TYPE v;
+            ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels,
+                &height, &winternitz);
+            if (ret == 0) {
+                v = wp11_HssHeightToLmsType(height);
+                if (v == 0)
+                    ret = NOT_AVAILABLE_E;
+                else if (data == NULL)
+                    *len = sizeof(v);
+                else if (*len < sizeof(v)) {
+                    *len = sizeof(v);
+                    ret = BUFFER_E;
+                }
+                else {
+                    XMEMCPY(data, &v, sizeof(v));
+                    *len = sizeof(v);
+                }
+            }
+            break;
+        }
+        case CKA_HSS_LMOTS_TYPE: {
+            CK_LMOTS_TYPE v;
+            ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels,
+                &height, &winternitz);
+            if (ret == 0) {
+                v = wp11_HssWToLmotsType(winternitz);
+                if (v == 0)
+                    ret = NOT_AVAILABLE_E;
+                else if (data == NULL)
+                    *len = sizeof(v);
+                else if (*len < sizeof(v)) {
+                    *len = sizeof(v);
+                    ret = BUFFER_E;
+                }
+                else {
+                    XMEMCPY(data, &v, sizeof(v));
+                    *len = sizeof(v);
+                }
+            }
+            break;
+        }
+        case CKA_HSS_LMS_TYPES:
+        case CKA_HSS_LMOTS_TYPES: {
+            /* wolfSSL uses uniform LMS/LMOTS parameters across all HSS levels, so
+             * every array entry is the top-level type. Per-level types (allowed
+             * by the PKCS#11 v3.3 profile) are not expressible by wolfSSL and are
+             * not supported here. */
+            CK_ULONG total;
+            CK_ULONG fill;
+            int i;
+            ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels,
+                &height, &winternitz);
+            if (ret == 0) {
+                total = (CK_ULONG)(sizeof(CK_ULONG) * levels);
+                fill = (type == CKA_HSS_LMS_TYPES)
+                    ? wp11_HssHeightToLmsType(height)
+                    : wp11_HssWToLmotsType(winternitz);
+                if (fill == 0)
+                    ret = NOT_AVAILABLE_E;
+                else if (data == NULL)
+                    *len = total;
+                else if (*len < total) {
+                    *len = total;
+                    ret = BUFFER_E;
+                }
+                else {
+                    for (i = 0; i < levels; i++)
+                        XMEMCPY(data + i * sizeof(CK_ULONG), &fill,
+                            sizeof(CK_ULONG));
+                    *len = total;
+                }
+            }
+            break;
+        }
+        case CKA_HSS_KEYS_REMAINING:
+            /* Remaining-signature count is a private-key/state property; not
+             * available in a verify-only build. Return NOT_AVAILABLE_E like the
+             * default arm; C_GetAttributeValue then sets ulValueLen. */
+            ret = NOT_AVAILABLE_E;
+            break;
+        case CKA_VALUE:
+            if (object->objClass == CKO_PUBLIC_KEY) {
+                word32 pubLen = 0;
+                ret = wc_LmsKey_GetPubLen(object->data.lmsKey, &pubLen);
+                if (ret == 0) {
+                    if (data == NULL)
+                        *len = pubLen;
+                    else if (*len < pubLen) {
+                        *len = pubLen;
+                        ret = BUFFER_E;
+                    }
+                    else {
+                        ret = wc_LmsKey_ExportPubRaw(object->data.lmsKey,
+                            data, &pubLen);
+                        if (ret == 0)
+                            *len = pubLen;
+                    }
+                }
+            }
+            else {
+                *len = CK_UNAVAILABLE_INFORMATION;
+                ret = NOT_AVAILABLE_E;
+            }
+            break;
+        default:
+            ret = NOT_AVAILABLE_E;
+            break;
+    }
+    return ret;
+}
+#endif /* WOLFPKCS11_LMS */
+
+#ifdef WOLFPKCS11_XMSS
+/* ===========================================================================
+ * XMSS/XMSS^MT (RFC 8391): verification and public-key import.
+ *
+ * Verify-only. One wolfSSL XmssKey type serves both XMSS and XMSS^MT; the
+ * PKCS#11 key type (CKK_XMSS vs CKK_XMSSMT) selects which via the is_xmssmt
+ * flag. The raw public key carries the parameter-set OID in its leading
+ * bytes, so wc_XmssKey_ImportPubRaw_ex derives the parameter set on import.
+ * A CKA_PARAMETER_SET attribute is optional and, when supplied, is validated
+ * against the OID in the key.
+ * ========================================================================= */
+
+/* Big-endian 32-bit read from a byte buffer (used to read the XMSS OID). */
+static word32 wp11_HbsReadU32(const byte* p)
+{
+    return ((word32)p[0] << 24) | ((word32)p[1] << 16)
+         | ((word32)p[2] << 8)  |  (word32)p[3];
+}
+
+/* Import a raw XMSS/XMSS^MT public key into the given wolfSSL XmssKey, deriving
+ * the parameter set from the embedded OID. is_xmssmt disambiguates the XMSS and
+ * XMSS^MT OID namespaces (which overlap) and comes from the PKCS#11 key type.
+ * When the caller supplies a CKA_PARAMETER_SET (params != NULL, the OID as a
+ * CK_ULONG) it must match the OID in the public key. On failure the key is NOT
+ * freed here; the caller owns it. */
+static int wp11_XmssImportPub(XmssKey* key, int is_xmssmt, int devId,
+    const byte* pub, word32 pubLen, const byte* params, word32 paramsLen)
+{
+    int ret;
+
+    ret = wc_XmssKey_Init(key, NULL, devId);
+    if (ret == 0 && params != NULL) {
+        CK_ULONG userOid;
+        if (paramsLen != sizeof(CK_ULONG) || pubLen < XMSS_OID_LEN) {
+            ret = BAD_FUNC_ARG;
+        }
+        else {
+            XMEMCPY(&userOid, params, sizeof(userOid));
+            if ((word32)userOid != wp11_HbsReadU32(pub))
+                ret = BAD_FUNC_ARG;
+        }
+    }
+    if (ret == 0)
+        ret = wc_XmssKey_ImportPubRaw_ex(key, pub, pubLen, is_xmssmt);
+    return ret;
+}
+
+/* Serialize the public key: keyData holds the raw RFC 8391 public key. */
+static int wp11_Object_Encode_XmssKey(WP11_Object* object)
+{
+    int ret;
+    word32 pubLen = 0;
+
+    if (object->objClass != CKO_PUBLIC_KEY)
+        return NOT_AVAILABLE_E;
+
+    ret = wc_XmssKey_GetPubLen(object->data.xmssKey, &pubLen);
+    if (ret == 0) {
+        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        object->keyData = (unsigned char*)XMALLOC(pubLen, NULL,
+            DYNAMIC_TYPE_TMP_BUFFER);
+        if (object->keyData == NULL)
+            ret = MEMORY_E;
+    }
+    if (ret == 0) {
+        ret = wc_XmssKey_ExportPubRaw(object->data.xmssKey, object->keyData,
+            &pubLen);
+        if (ret == 0)
+            object->keyDataLen = (int)pubLen;
+    }
+    return ret;
+}
+
+static int wp11_Object_Decode_XmssKey(WP11_Object* object)
+{
+    int ret;
+
+    if (object->objClass != CKO_PUBLIC_KEY)
+        return NOT_AVAILABLE_E;
+
+    /* Reload from the stored raw public key; wolfSSL re-derives the parameter
+     * set from the embedded OID (no separate parameter set is persisted). */
+    ret = wp11_XmssImportPub(object->data.xmssKey,
+        (object->type == CKK_XMSSMT) ? 1 : 0, object->devId, object->keyData,
+        (word32)object->keyDataLen, NULL, 0);
+    /* Object owns the key on all paths; encoded stays 0 for the single free in
+     * WP11_Object_Free. See wp11_Object_Decode_HssKey. */
+    object->encoded = 0;
+    return ret;
+}
+
+static int wp11_Object_Load_XmssKey(WP11_Object* object, int tokenId, int objId)
+{
+    int ret;
+    void* storage = NULL;
+
+    ret = wp11_storage_open_readonly(WOLFPKCS11_STORE_XMSSKEY_PUB, tokenId,
+        objId, &storage);
+    if (ret == 0) {
+        ret = wp11_storage_read_alloc_array(storage, &object->keyData,
+            &object->keyDataLen);
+        wp11_storage_close(storage);
+    }
+    return ret;
+}
+
+static int wp11_Object_Store_XmssKey(WP11_Object* object, int tokenId,
+    int objId)
+{
+    int ret = 0;
+    void* storage = NULL;
+
+    if (object->keyData == NULL)
+        ret = wp11_Object_Encode_XmssKey(object);
+    if (ret == 0)
+        ret = wp11_storage_open(WOLFPKCS11_STORE_XMSSKEY_PUB, tokenId, objId,
+            object->keyDataLen, &storage);
+    if (ret == 0) {
+        ret = wp11_storage_write_array(storage, object->keyData,
+            object->keyDataLen);
+        wp11_storage_close(storage);
+    }
+    return ret;
+}
+
+/* Import an XMSS/XMSS^MT public key from a C_CreateObject template. data[1] is
+ * the raw RFC 8391 public key; data[0] (CKA_PARAMETER_SET, the OID as a
+ * CK_ULONG) is optional and, when present, is validated against the key.
+ * Private-key import is rejected. */
+int WP11_Object_SetXmssKey(WP11_Object* object, unsigned char** data,
+                           CK_ULONG* len)
+{
+    int ret = 0;
+    XmssKey* newKey = NULL;
+
+    if (object == NULL || data == NULL || len == NULL)
+        return BAD_FUNC_ARG;
+    if (object->objClass != CKO_PUBLIC_KEY)
+        return BAD_FUNC_ARG;
+    /* A public key must carry its value; an absent CKA_VALUE is an
+     * incomplete template (no keygen path fills it later). Reject it. */
+    if (data[1] == NULL)
+        return BAD_FUNC_ARG;
+
+    if (object->onToken)
+        WP11_Lock_LockRW(object->lock);
+
+    /* Import into a temporary key and swap it in only after it validates, so a
+     * failed re-import leaves the existing key unchanged (PKCS#11 requires a
+     * failed C_SetAttributeValue to be a no-op). */
+    newKey = (XmssKey*)XMALLOC(sizeof(XmssKey), NULL, DYNAMIC_TYPE_KEY);
+    if (newKey == NULL)
+        ret = MEMORY_E;
+    if (ret == 0) {
+        XMEMSET(newKey, 0, sizeof(XmssKey));
+        ret = wp11_XmssImportPub(newKey, (object->type == CKK_XMSSMT) ? 1 : 0,
+            object->devId, data[1], (word32)len[1], data[0], (word32)len[0]);
+    }
+    if (ret == 0) {
+        /* Replace the live key and drop the cached serialization so a later
+         * store re-encodes from the new key. */
+        if (object->data.xmssKey != NULL) {
+            if (!object->encoded)
+                wc_XmssKey_Free(object->data.xmssKey);
+            XFREE(object->data.xmssKey, NULL, DYNAMIC_TYPE_KEY);
+        }
+        object->data.xmssKey = newKey;
+        object->encoded = 0;
+        newKey = NULL;
+        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        object->keyData = NULL;
+        object->keyDataLen = 0;
+    }
+    if (newKey != NULL) {
+        wc_XmssKey_Free(newKey);
+        XFREE(newKey, NULL, DYNAMIC_TYPE_KEY);
+    }
+
+    if (object->onToken)
+        WP11_Lock_UnlockRW(object->lock);
+    return ret;
+}
+
+/* Verify an XMSS/XMSS^MT signature over a raw message. Stateless. */
+int WP11_Xmss_Verify(unsigned char* sig, word32 sigLen, unsigned char* data,
+                     word32 dataLen, int* stat, WP11_Object* pub)
+{
+    int ret;
+    word32 expSigLen = 0;
+
+    if (pub == NULL || pub->data.xmssKey == NULL || stat == NULL)
+        return BAD_FUNC_ARG;
+
+    /* Verification only reads the key: wc_XmssKey_Verify works from a locally
+     * allocated XmssState, so a shared RO lock is safe for concurrent verifies
+     * on the same token object. */
+    if (pub->onToken)
+        WP11_Lock_LockRO(pub->lock);
+
+    /* A wrong-length signature cannot be valid for this key; report it as an
+     * invalid signature rather than a function failure. wolfSSL's XMSS verify
+     * also rejects a zero-length message with BAD_FUNC_ARG; treat that the same
+     * way (an invalid verification, not an internal failure). */
+    if (wc_XmssKey_GetSigLen(pub->data.xmssKey, &expSigLen) == 0 &&
+            sigLen != expSigLen) {
+        *stat = 0;
+        ret = 0;
+    }
+    else if (dataLen == 0) {
+        *stat = 0;
+        ret = 0;
+    }
+    else {
+        ret = wc_XmssKey_Verify(pub->data.xmssKey, sig, sigLen, data,
+            (int)dataLen);
+        /* Only SIG_VERIFY_E maps to stat=0; other argument/state errors
+         * surface as a function failure so they are not silently reported as
+         * an invalid signature. */
+        if (ret == 0) {
+            *stat = 1;
+        }
+        else if (ret == SIG_VERIFY_E) {
+            *stat = 0;
+            ret = 0;
+        }
+        else {
+            *stat = 0;
+        }
+    }
+
+    if (pub->onToken)
+        WP11_Lock_UnlockRO(pub->lock);
+
+    return ret;
+}
+
+/* Serve XMSS-specific attributes from a public-key object. */
+static int XmssObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
+                              byte* data, CK_ULONG* len)
+{
+    int ret = 0;
+
+    if (object == NULL || object->data.xmssKey == NULL || len == NULL)
+        return BAD_FUNC_ARG;
+
+    switch (type) {
+        case CKA_VALUE:
+            if (object->objClass == CKO_PUBLIC_KEY) {
+                word32 pubLen = 0;
+                ret = wc_XmssKey_GetPubLen(object->data.xmssKey, &pubLen);
+                if (ret == 0) {
+                    if (data == NULL)
+                        *len = pubLen;
+                    else if (*len < pubLen) {
+                        *len = pubLen;
+                        ret = BUFFER_E;
+                    }
+                    else {
+                        ret = wc_XmssKey_ExportPubRaw(object->data.xmssKey,
+                            data, &pubLen);
+                        if (ret == 0)
+                            *len = pubLen;
+                    }
+                }
+            }
+            else {
+                *len = CK_UNAVAILABLE_INFORMATION;
+                ret = NOT_AVAILABLE_E;
+            }
+            break;
+        case CKA_PARAMETER_SET: {
+            /* The XMSS parameter set is identified by the OID in the leading
+             * bytes of the raw public key; return it as a CK_ULONG. */
+            CK_ULONG v;
+            word32 pubLen = 0;
+            byte* raw;
+
+            if (object->objClass != CKO_PUBLIC_KEY) {
+                *len = CK_UNAVAILABLE_INFORMATION;
+                ret = NOT_AVAILABLE_E;
+                break;
+            }
+            if (data == NULL) {
+                *len = sizeof(v);
+                break;
+            }
+            if (*len < sizeof(v)) {
+                *len = sizeof(v);
+                ret = BUFFER_E;
+                break;
+            }
+            ret = wc_XmssKey_GetPubLen(object->data.xmssKey, &pubLen);
+            if (ret == 0 && pubLen < XMSS_OID_LEN)
+                ret = NOT_AVAILABLE_E;
+            if (ret == 0) {
+                raw = (byte*)XMALLOC(pubLen, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                if (raw == NULL) {
+                    ret = MEMORY_E;
+                }
+                else {
+                    ret = wc_XmssKey_ExportPubRaw(object->data.xmssKey, raw,
+                        &pubLen);
+                    if (ret == 0) {
+                        v = (CK_ULONG)wp11_HbsReadU32(raw);
+                        XMEMCPY(data, &v, sizeof(v));
+                        *len = sizeof(v);
+                    }
+                    XFREE(raw, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                }
+            }
+            break;
+        }
+        default:
+            ret = NOT_AVAILABLE_E;
+            break;
+    }
+    return ret;
+}
+#endif /* WOLFPKCS11_XMSS */
+
 /**
  * Decode the symmetric key - requires decryption.
  *
@@ -5536,6 +6353,17 @@ static int wp11_Object_Load(WP11_Object* object, int tokenId, int objId)
                     ret = wp11_Object_Load_MlKemKey(object, tokenId, objId);
                     break;
             #endif
+            #ifdef WOLFPKCS11_LMS
+                case CKK_HSS:
+                    ret = wp11_Object_Load_HssKey(object, tokenId, objId);
+                    break;
+            #endif
+            #ifdef WOLFPKCS11_XMSS
+                case CKK_XMSS:
+                case CKK_XMSSMT:
+                    ret = wp11_Object_Load_XmssKey(object, tokenId, objId);
+                    break;
+            #endif
             #ifndef NO_AES
                 case CKK_AES:
             #endif
@@ -5717,6 +6545,17 @@ static int wp11_Object_Store(WP11_Object* object, int tokenId, int objId)
                     ret = wp11_Object_Store_MlKemKey(object, tokenId, objId);
                     break;
             #endif
+            #ifdef WOLFPKCS11_LMS
+                case CKK_HSS:
+                    ret = wp11_Object_Store_HssKey(object, tokenId, objId);
+                    break;
+            #endif
+            #ifdef WOLFPKCS11_XMSS
+                case CKK_XMSS:
+                case CKK_XMSSMT:
+                    ret = wp11_Object_Store_XmssKey(object, tokenId, objId);
+                    break;
+            #endif
             #ifndef NO_AES
                 case CKK_AES:
             #endif
@@ -5785,6 +6624,17 @@ static int wp11_Object_Decode(WP11_Object* object)
         #ifdef WOLFPKCS11_MLKEM
             case CKK_ML_KEM:
                 ret = wp11_Object_Decode_MlKemKey(object);
+                break;
+        #endif
+        #ifdef WOLFPKCS11_LMS
+            case CKK_HSS:
+                ret = wp11_Object_Decode_HssKey(object);
+                break;
+        #endif
+        #ifdef WOLFPKCS11_XMSS
+            case CKK_XMSS:
+            case CKK_XMSSMT:
+                ret = wp11_Object_Decode_XmssKey(object);
                 break;
         #endif
         #ifndef NO_AES
@@ -5872,6 +6722,17 @@ static int wp11_Object_Encode(WP11_Object* object, int protect)
                     wc_MlKemKey_Free(object->data.mlKemKey);
                     object->encoded = 1;
                 }
+                break;
+        #endif
+        #ifdef WOLFPKCS11_LMS
+            case CKK_HSS:
+                ret = wp11_Object_Encode_HssKey(object);
+                break;
+        #endif
+        #ifdef WOLFPKCS11_XMSS
+            case CKK_XMSS:
+            case CKK_XMSSMT:
+                ret = wp11_Object_Encode_XmssKey(object);
                 break;
         #endif
         #ifndef NO_AES
@@ -5969,6 +6830,17 @@ static int wp11_Object_Unstore(WP11_Object* object, int tokenId, int objId)
                 storeObjType = WOLFPKCS11_STORE_MLKEMKEY_PRIV;
             else
                 storeObjType = WOLFPKCS11_STORE_MLKEMKEY_PUB;
+            break;
+    #endif
+    #ifdef WOLFPKCS11_LMS
+        case CKK_HSS:
+            storeObjType = WOLFPKCS11_STORE_HSSKEY_PUB;
+            break;
+    #endif
+    #ifdef WOLFPKCS11_XMSS
+        case CKK_XMSS:
+        case CKK_XMSSMT:
+            storeObjType = WOLFPKCS11_STORE_XMSSKEY_PUB;
             break;
     #endif
     #ifndef NO_AES
@@ -7959,6 +8831,12 @@ static int wp11_init_get_op_category(int init)
         case WP11_INIT_AES_CMAC_VERIFY:
         case WP11_INIT_TLS_MAC_VERIFY:
         case WP11_INIT_MLDSA_VERIFY:
+#ifdef WOLFPKCS11_LMS
+        case WP11_INIT_HSS_VERIFY:
+#endif
+#ifdef WOLFPKCS11_XMSS
+        case WP11_INIT_XMSS_VERIFY:
+#endif
             return WP11_OP_VERIFY;
 
         default:
@@ -9253,6 +10131,23 @@ void WP11_Object_Free(WP11_Object* object)
                 wc_MlKemKey_Free(object->data.mlKemKey);
             XFREE(object->data.mlKemKey, NULL, DYNAMIC_TYPE_KEY);
             object->data.mlKemKey = NULL;
+        }
+    #endif
+    #ifdef WOLFPKCS11_LMS
+        if (object->type == CKK_HSS && object->data.lmsKey != NULL) {
+            if (!object->encoded)
+                wc_LmsKey_Free(object->data.lmsKey);
+            XFREE(object->data.lmsKey, NULL, DYNAMIC_TYPE_KEY);
+            object->data.lmsKey = NULL;
+        }
+    #endif
+    #ifdef WOLFPKCS11_XMSS
+        if ((object->type == CKK_XMSS || object->type == CKK_XMSSMT) &&
+                object->data.xmssKey != NULL) {
+            if (!object->encoded)
+                wc_XmssKey_Free(object->data.xmssKey);
+            XFREE(object->data.xmssKey, NULL, DYNAMIC_TYPE_KEY);
+            object->data.xmssKey = NULL;
         }
     #endif
         if ((object->type == CKK_AES || object->type == CKK_GENERIC_SECRET ||
@@ -11502,6 +12397,17 @@ int WP11_Object_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
                             ret = MlKemObject_GetAttr(object, type, data, len);
                             break;
 #endif
+#ifdef WOLFPKCS11_LMS
+                        case CKK_HSS:
+                            ret = HssObject_GetAttr(object, type, data, len);
+                            break;
+#endif
+#ifdef WOLFPKCS11_XMSS
+                        case CKK_XMSS:
+                        case CKK_XMSSMT:
+                            ret = XmssObject_GetAttr(object, type, data, len);
+                            break;
+#endif
 #ifndef NO_AES
                         case CKK_AES:
 #endif
@@ -11829,6 +12735,13 @@ int WP11_Object_SetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
 #ifdef WOLFPKCS11_MLDSA
                 case CKK_ML_DSA:
 #endif
+#ifdef WOLFPKCS11_LMS
+                case CKK_HSS:
+#endif
+#ifdef WOLFPKCS11_XMSS
+                case CKK_XMSS:
+                case CKK_XMSSMT:
+#endif
 #ifndef NO_DH
                 case CKK_DH:
 #endif
@@ -11927,6 +12840,15 @@ int WP11_Object_SetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
             case CKK_ML_KEM:
                 break;
 #endif
+#ifdef WOLFPKCS11_LMS
+            case CKK_HSS:
+                break;
+#endif
+#ifdef WOLFPKCS11_XMSS
+            case CKK_XMSS:
+            case CKK_XMSSMT:
+                break;
+#endif
             default:
                 ret = BAD_FUNC_ARG;
                 break;
@@ -11986,6 +12908,24 @@ int WP11_Object_SetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
         case CKA_WOLFSSL_DEVID:
             object->devId = (int)(*(CK_ULONG*)data);
             break;
+#ifdef WOLFPKCS11_LMS
+        case CKA_HSS_LEVELS:
+        case CKA_HSS_LMS_TYPE:
+        case CKA_HSS_LMOTS_TYPE:
+        case CKA_HSS_LMS_TYPES:
+        case CKA_HSS_LMOTS_TYPES:
+        case CKA_HSS_KEYS_REMAINING:
+            /* HSS parameter attributes are key-derived and read-only. The
+             * WP11_Object_SetHssKey template pass validates the scalar forms
+             * against the public key and rejects a value-less or mismatched set
+             * (CKR_ATTRIBUTE_VALUE_INVALID) before this runs; the array and
+             * keys-remaining forms are values served by HssObject_GetAttr.
+             * Accept them all as a no-op on an HSS object so recreating one from
+             * its own attributes is not rejected. */
+            if (object->type != CKK_HSS)
+                ret = BAD_FUNC_ARG;
+            break;
+#endif
 
     #ifdef WOLFSSL_STM32U5_DHUK
         case CKA_WOLFSSL_DHUK_IV:

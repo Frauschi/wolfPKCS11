@@ -145,6 +145,31 @@ static CK_ATTRIBUTE_TYPE mlKemKeyParams[] = {
 #define MLKEM_KEY_PARAMS_CNT  (sizeof(mlKemKeyParams)/sizeof(*mlKemKeyParams))
 #endif
 
+#ifdef WOLFPKCS11_LMS
+/* HSS public-key attributes (PKCS#11 v3.3 HSS profile). data[0..2] are the
+ * optional CK_ULONG parameters CKA_HSS_LEVELS, CKA_HSS_LMS_TYPE and
+ * CKA_HSS_LMOTS_TYPE (validated against the key when supplied; otherwise
+ * self-derived from it); data[3] = raw RFC 8554 public key. */
+static CK_ATTRIBUTE_TYPE hssKeyParams[] = {
+    CKA_HSS_LEVELS,
+    CKA_HSS_LMS_TYPE,
+    CKA_HSS_LMOTS_TYPE,
+    CKA_VALUE
+};
+#define HSS_KEY_PARAMS_CNT     (sizeof(hssKeyParams)/sizeof(*hssKeyParams))
+#endif
+
+#ifdef WOLFPKCS11_XMSS
+/* XMSS/XMSS^MT key data attributes. data[0] = optional CKA_PARAMETER_SET
+ * (the OID as a CK_ULONG; when supplied it is validated against the OID in the
+ * public key and a mismatch is rejected), data[1] = raw XMSS public key. */
+static CK_ATTRIBUTE_TYPE xmssKeyParams[] = {
+    CKA_PARAMETER_SET,
+    CKA_VALUE
+};
+#define XMSS_KEY_PARAMS_CNT    (sizeof(xmssKeyParams)/sizeof(*xmssKeyParams))
+#endif
+
 /* Secret key data attributes. */
 static CK_ATTRIBUTE_TYPE secretKeyParams[] = {
     CKA_VALUE_LEN,
@@ -184,16 +209,51 @@ static CK_ATTRIBUTE_TYPE trustParams[] = {
 #define TRUST_PARAMS_CNT    (sizeof(trustParams)/sizeof(*trustParams))
 #endif
 
-/* Identify maximum count for stack array. */
-#ifndef NO_RSA
-#define OBJ_MAX_PARAMS        RSA_KEY_PARAMS_CNT
-#elif defined(HAVE_ECC)
-#define OBJ_MAX_PARAMS        EC_KEY_PARAMS_CNT
-#elif !defined(NO_DH)
-#define OBJ_MAX_PARAMS        DH_KEY_PARAMS_CNT
-#else
-#define OBJ_MAX_PARAMS        SECRET_KEY_PARAMS_CNT
+/* The SetAttributeValue stack arrays data[]/len[] must hold the largest
+ * attribute set of any enabled key or object type (see the cnt assignments in
+ * SetAttributeValue). Default the optional counts to zero so the maximum below
+ * is well defined in every build: a token with RSA disabled but LMS enabled
+ * still needs room for the four HSS slots, for example. */
+#ifndef RSA_KEY_PARAMS_CNT
+#define RSA_KEY_PARAMS_CNT     0
 #endif
+#ifndef EC_KEY_PARAMS_CNT
+#define EC_KEY_PARAMS_CNT      0
+#endif
+#ifndef MLDSA_KEY_PARAMS_CNT
+#define MLDSA_KEY_PARAMS_CNT   0
+#endif
+#ifndef DH_KEY_PARAMS_CNT
+#define DH_KEY_PARAMS_CNT      0
+#endif
+#ifndef MLKEM_KEY_PARAMS_CNT
+#define MLKEM_KEY_PARAMS_CNT   0
+#endif
+#ifndef HSS_KEY_PARAMS_CNT
+#define HSS_KEY_PARAMS_CNT     0
+#endif
+#ifndef XMSS_KEY_PARAMS_CNT
+#define XMSS_KEY_PARAMS_CNT    0
+#endif
+#ifndef TRUST_PARAMS_CNT
+#define TRUST_PARAMS_CNT       0
+#endif
+
+/* Compile-time maximum of two attribute counts. */
+#define WP11_PARAMS_MAX(a, b)  ((a) > (b) ? (a) : (b))
+
+/* Identify maximum count for stack array. */
+#define OBJ_MAX_PARAMS                                                    \
+    WP11_PARAMS_MAX(RSA_KEY_PARAMS_CNT,                                   \
+    WP11_PARAMS_MAX(EC_KEY_PARAMS_CNT,                                    \
+    WP11_PARAMS_MAX(MLDSA_KEY_PARAMS_CNT,                                 \
+    WP11_PARAMS_MAX(DH_KEY_PARAMS_CNT,                                    \
+    WP11_PARAMS_MAX(MLKEM_KEY_PARAMS_CNT,                                 \
+    WP11_PARAMS_MAX(HSS_KEY_PARAMS_CNT,                                   \
+    WP11_PARAMS_MAX(XMSS_KEY_PARAMS_CNT,                                  \
+    WP11_PARAMS_MAX(SECRET_KEY_PARAMS_CNT,                                \
+    WP11_PARAMS_MAX(DATA_PARAMS_CNT,                                      \
+    WP11_PARAMS_MAX(CERT_PARAMS_CNT, TRUST_PARAMS_CNT))))))))))
 
 typedef struct AttributeType {
     CK_ATTRIBUTE_TYPE attr;            /* Crypto-Ki attribute                 */
@@ -275,6 +335,12 @@ static AttributeType attrType[] = {
     { CKA_SEED,                        ATTR_TYPE_DATA  },
     { CKA_ENCAPSULATE,                 ATTR_TYPE_BOOL  },
     { CKA_DECAPSULATE,                 ATTR_TYPE_BOOL  },
+    { CKA_HSS_LEVELS,                  ATTR_TYPE_ULONG },
+    { CKA_HSS_LMS_TYPE,                ATTR_TYPE_ULONG },
+    { CKA_HSS_LMOTS_TYPE,              ATTR_TYPE_ULONG },
+    { CKA_HSS_LMS_TYPES,               ATTR_TYPE_DATA  },
+    { CKA_HSS_LMOTS_TYPES,             ATTR_TYPE_DATA  },
+    { CKA_HSS_KEYS_REMAINING,          ATTR_TYPE_ULONG },
 #ifdef WOLFPKCS11_NSS
     { CKA_CERT_SHA1_HASH,              ATTR_TYPE_DATA  },
     { CKA_CERT_MD5_HASH,               ATTR_TYPE_DATA  },
@@ -891,6 +957,19 @@ static CK_RV SetAttributeValue(WP11_Session* session, WP11_Object* obj,
                 cnt = MLKEM_KEY_PARAMS_CNT;
                 break;
         #endif
+        #ifdef WOLFPKCS11_LMS
+            case CKK_HSS:
+                attrs = hssKeyParams;
+                cnt = HSS_KEY_PARAMS_CNT;
+                break;
+        #endif
+        #ifdef WOLFPKCS11_XMSS
+            case CKK_XMSS:
+            case CKK_XMSSMT:
+                attrs = xmssKeyParams;
+                cnt = XMSS_KEY_PARAMS_CNT;
+                break;
+        #endif
         #ifdef WOLFPKCS11_HKDF
             case CKK_HKDF:
         #endif
@@ -963,6 +1042,31 @@ static CK_RV SetAttributeValue(WP11_Session* session, WP11_Object* obj,
         #ifdef WOLFPKCS11_MLKEM
                 case CKK_ML_KEM:
                     ret = WP11_Object_SetMlKemKey(obj, data, len);
+                    break;
+        #endif
+        #ifdef WOLFPKCS11_LMS
+                case CKK_HSS:
+                    ret = WP11_Object_SetHssKey(obj, data, len);
+                    /* Importing parses the caller-supplied public key, so any
+                     * failure other than out-of-memory means the CKA_VALUE or a
+                     * parameter attribute is bad (wrong length, unknown LMS/LMOTS
+                     * type, unparsable header), not an internal fault. MEMORY_E
+                     * falls through to CKR_DEVICE_MEMORY below. */
+                    if (ret != 0 && ret != MEMORY_E) {
+                        return CKR_ATTRIBUTE_VALUE_INVALID;
+                    }
+                    break;
+        #endif
+        #ifdef WOLFPKCS11_XMSS
+                case CKK_XMSS:
+                case CKK_XMSSMT:
+                    ret = WP11_Object_SetXmssKey(obj, data, len);
+                    /* As for HSS: any non-memory import failure is a bad
+                     * attribute value (truncated key, unknown/invalid OID,
+                     * unparsable header), not an internal fault. */
+                    if (ret != 0 && ret != MEMORY_E) {
+                        return CKR_ATTRIBUTE_VALUE_INVALID;
+                    }
                     break;
         #endif
         #ifndef NO_AES
@@ -1375,7 +1479,9 @@ static CK_RV CreateObject(WP11_Session* session, CK_ATTRIBUTE_PTR pTemplate,
         if (objType != CKK_RSA && objType != CKK_EC && objType != CKK_DH &&
             objType != CKK_AES && objType != CKK_HKDF &&
             objType != CKK_GENERIC_SECRET && objType != CKK_ML_DSA &&
-            objType != CKK_ML_KEM) {
+            objType != CKK_ML_KEM && objType != CKK_HSS &&
+            objType != CKK_XMSS && objType != CKK_XMSSMT
+            ) {
             return CKR_ATTRIBUTE_VALUE_INVALID;
         }
     }
@@ -6004,6 +6110,34 @@ CK_RV C_VerifyInit(CK_SESSION_HANDLE hSession,
             init |= WP11_INIT_MLDSA_VERIFY;
             break;
 #endif
+#ifdef WOLFPKCS11_LMS
+        case CKM_HSS:
+            if (type != CKK_HSS)
+                return CKR_KEY_TYPE_INCONSISTENT;
+            if (pMechanism->pParameter != NULL ||
+                    pMechanism->ulParameterLen != 0)
+                return CKR_MECHANISM_PARAM_INVALID;
+            init |= WP11_INIT_HSS_VERIFY;
+            break;
+#endif
+#ifdef WOLFPKCS11_XMSS
+        case CKM_XMSS:
+            if (type != CKK_XMSS)
+                return CKR_KEY_TYPE_INCONSISTENT;
+            if (pMechanism->pParameter != NULL ||
+                    pMechanism->ulParameterLen != 0)
+                return CKR_MECHANISM_PARAM_INVALID;
+            init |= WP11_INIT_XMSS_VERIFY;
+            break;
+        case CKM_XMSSMT:
+            if (type != CKK_XMSSMT)
+                return CKR_KEY_TYPE_INCONSISTENT;
+            if (pMechanism->pParameter != NULL ||
+                    pMechanism->ulParameterLen != 0)
+                return CKR_MECHANISM_PARAM_INVALID;
+            init |= WP11_INIT_XMSS_VERIFY;
+            break;
+#endif
 #ifndef NO_HMAC
     #ifndef NO_MD5
         case CKM_MD5_HMAC:
@@ -6335,6 +6469,25 @@ CK_RV C_Verify(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
 
             ret = WP11_Mldsa_Verify(pSignature, (int)ulSignatureLen, pData,
                                     (int)ulDataLen, &stat, obj, session);
+            break;
+#endif
+#ifdef WOLFPKCS11_LMS
+        case CKM_HSS:
+            if (!WP11_Session_IsOpInitialized(session, WP11_INIT_HSS_VERIFY))
+                return CKR_OPERATION_NOT_INITIALIZED;
+
+            ret = WP11_Hss_Verify(pSignature, (word32)ulSignatureLen, pData,
+                                  (word32)ulDataLen, &stat, obj);
+            break;
+#endif
+#ifdef WOLFPKCS11_XMSS
+        case CKM_XMSS:
+        case CKM_XMSSMT:
+            if (!WP11_Session_IsOpInitialized(session, WP11_INIT_XMSS_VERIFY))
+                return CKR_OPERATION_NOT_INITIALIZED;
+
+            ret = WP11_Xmss_Verify(pSignature, (word32)ulSignatureLen, pData,
+                                   (word32)ulDataLen, &stat, obj);
             break;
 #endif
 #ifndef NO_HMAC
