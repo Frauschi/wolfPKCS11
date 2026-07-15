@@ -27,7 +27,7 @@
  * CKF_OS_LOCKING_OK). The buggy code resolved the handle to a raw WP11_Object*
  * under a released read lock, so both callers reached WP11_Object_Free on the
  * same pointer - a double free - and the loser also dereferenced the freed
- * object inside WP11_Session_RemoveObject.
+ * object inside WP11_Session_RemoveObjectByHandle.
  *
  * Each round below creates one token object and has two threads (each on its
  * own session) destroy it simultaneously. The fix must guarantee that exactly
