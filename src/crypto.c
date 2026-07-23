@@ -5054,6 +5054,16 @@ CK_RV C_SignInit(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
             init |= WP11_INIT_MLDSA_SIGN;
             break;
 #endif
+#ifdef WOLFPKCS11_LMS_PRIVATE
+        case CKM_HSS:
+            if (type != CKK_HSS)
+                return CKR_KEY_TYPE_INCONSISTENT;
+            if (pMechanism->pParameter != NULL ||
+                    pMechanism->ulParameterLen != 0)
+                return CKR_MECHANISM_PARAM_INVALID;
+            init |= WP11_INIT_HSS_SIGN;
+            break;
+#endif
 #ifndef NO_HMAC
     #ifndef NO_MD5
         case CKM_MD5_HMAC:
@@ -5438,6 +5448,30 @@ CK_RV C_Sign(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
 
             ret = WP11_Mldsa_Sign(pData, (int)ulDataLen, pSignature,
                                   &sigLen, obj, session);
+            *pulSignatureLen = sigLen;
+            break;
+#endif
+#ifdef WOLFPKCS11_LMS_PRIVATE
+        case CKM_HSS:
+            if (!WP11_Session_IsOpInitialized(session, WP11_INIT_HSS_SIGN))
+                return CKR_OPERATION_NOT_INITIALIZED;
+
+            sigLen = WP11_Hss_SigLen(obj);
+            if (sigLen == 0)
+                return CKR_FUNCTION_FAILED;
+            if (pSignature == NULL) {
+                *pulSignatureLen = sigLen;
+                return CKR_OK;
+            }
+            if (sigLen > (word32)*pulSignatureLen)
+                return CKR_BUFFER_TOO_SMALL;
+
+            ret = WP11_Hss_Sign(pData, (word32)ulDataLen, pSignature, &sigLen,
+                                obj);
+            if (ret == NOT_AVAILABLE_E)
+                return CKR_DEVICE_ERROR;  /* poisoned; reload required */
+            if (ret != 0)
+                return CKR_FUNCTION_FAILED;
             *pulSignatureLen = sigLen;
             break;
 #endif
@@ -7925,6 +7959,83 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
                     rv = CKR_FUNCTION_FAILED;
             }
             break;
+#endif
+#ifdef WOLFPKCS11_LMS_PRIVATE
+        case CKM_HSS_KEY_PAIR_GEN: {
+            CK_ATTRIBUTE_PTR aLevels = NULL, aLms = NULL, aLmots = NULL;
+            CK_ATTRIBUTE_PTR aTokPub = NULL, aTokPriv = NULL;
+            CK_ULONG hssLevels;
+            CK_LMS_TYPE hssLms;
+            CK_LMOTS_TYPE hssLmots;
+
+            /* v3.3: the keygen mechanism carries no parameter. */
+            if (pMechanism->pParameter != NULL ||
+                    pMechanism->ulParameterLen != 0) {
+                return CKR_MECHANISM_PARAM_INVALID;
+            }
+            /* Stateful keys must be token-resident: a session-only key that
+             * vanishes on a crash could release a signature whose one-time
+             * index was never persisted. Require CKA_TOKEN=TRUE on both arms. */
+            FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount,
+                CKA_TOKEN, &aTokPub);
+            FindAttributeType(pPrivateKeyTemplate, ulPrivateKeyAttributeCount,
+                CKA_TOKEN, &aTokPriv);
+            if (aTokPub == NULL || aTokPub->pValue == NULL ||
+                    aTokPub->ulValueLen != sizeof(CK_BBOOL) ||
+                    *(CK_BBOOL*)aTokPub->pValue != CK_TRUE ||
+                    aTokPriv == NULL || aTokPriv->pValue == NULL ||
+                    aTokPriv->ulValueLen != sizeof(CK_BBOOL) ||
+                    *(CK_BBOOL*)aTokPriv->pValue != CK_TRUE) {
+                return CKR_TEMPLATE_INCONSISTENT;
+            }
+            /* Parameters come from the key template attributes (v3.3 HSS
+             * profile), accepted from either arm. */
+            FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount,
+                CKA_HSS_LEVELS, &aLevels);
+            if (aLevels == NULL)
+                FindAttributeType(pPrivateKeyTemplate,
+                    ulPrivateKeyAttributeCount, CKA_HSS_LEVELS, &aLevels);
+            FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount,
+                CKA_HSS_LMS_TYPE, &aLms);
+            if (aLms == NULL)
+                FindAttributeType(pPrivateKeyTemplate,
+                    ulPrivateKeyAttributeCount, CKA_HSS_LMS_TYPE, &aLms);
+            FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount,
+                CKA_HSS_LMOTS_TYPE, &aLmots);
+            if (aLmots == NULL)
+                FindAttributeType(pPrivateKeyTemplate,
+                    ulPrivateKeyAttributeCount, CKA_HSS_LMOTS_TYPE, &aLmots);
+            if (aLevels == NULL || aLms == NULL || aLmots == NULL)
+                return CKR_TEMPLATE_INCOMPLETE;
+            if (aLevels->pValue == NULL ||
+                    aLevels->ulValueLen != sizeof(CK_ULONG) ||
+                    aLms->pValue == NULL ||
+                    aLms->ulValueLen != sizeof(CK_ULONG) ||
+                    aLmots->pValue == NULL ||
+                    aLmots->ulValueLen != sizeof(CK_ULONG)) {
+                return CKR_ATTRIBUTE_VALUE_INVALID;
+            }
+            hssLevels = *(CK_ULONG*)aLevels->pValue;
+            hssLms = *(CK_LMS_TYPE*)aLms->pValue;
+            hssLmots = *(CK_LMOTS_TYPE*)aLmots->pValue;
+
+            *phPublicKey = *phPrivateKey = CK_INVALID_HANDLE;
+            rv = NewObject(session, CKK_HSS, CKO_PUBLIC_KEY,
+                pPublicKeyTemplate, ulPublicKeyAttributeCount, &pub);
+            if (rv == CKR_OK) {
+                rv = NewObject(session, CKK_HSS, CKO_PRIVATE_KEY,
+                    pPrivateKeyTemplate, ulPrivateKeyAttributeCount, &priv);
+            }
+            if (rv == CKR_OK) {
+                ret = WP11_Hss_GenerateKeyPair(pub, priv, hssLevels, hssLms,
+                    hssLmots, WP11_Session_GetSlot(session));
+                if (ret == BAD_FUNC_ARG)
+                    rv = CKR_MECHANISM_PARAM_INVALID;
+                else if (ret != 0)
+                    rv = CKR_FUNCTION_FAILED;
+            }
+            break;
+        }
 #endif
 #ifdef WOLFPKCS11_MLDSA
         case CKM_ML_DSA_KEY_PAIR_GEN:

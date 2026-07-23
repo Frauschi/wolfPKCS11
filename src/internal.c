@@ -1553,6 +1553,12 @@ static int wolfPKCS11_Store_Name(int type, CK_ULONG id1, CK_ULONG id2, char* nam
             ret = XSNPRINTF(name, nameLen, "%s/wp11_hsskey_pub_%016lx_%016lx",
                     str, id1, id2);
             break;
+#ifdef WOLFPKCS11_LMS_PRIVATE
+        case WOLFPKCS11_STORE_HSSKEY_PRIV:
+            ret = XSNPRINTF(name, nameLen, "%s/wp11_hsskey_priv_%016lx_%016lx",
+                    str, id1, id2);
+            break;
+#endif
 #endif
 #ifdef WOLFPKCS11_XMSS
         case WOLFPKCS11_STORE_XMSSKEY_PUB:
@@ -6350,11 +6356,19 @@ static int wp11_Object_Encode_HssKey(WP11_Object* object)
         /* Private key: a non-secret metadata shell (params + cached public
          * key + 8-byte stateId trailer). The secret one-time-signature state
          * is NEVER written to keyData — it lives only in the AES-GCM state
-         * file written by the wolfSSL write callback. */
+         * file written by the wolfSSL write callback.
+         *
+         * The shell is immutable after keygen. Once materialized (built at
+         * keygen, or loaded from disk), reuse it: a reloaded signing key
+         * cannot re-export its public root (wolfSSL keeps a key in either
+         * signing or verify state), so rebuilding here would fail. */
         int levels = 0, height = 0, winternitz = 0;
         byte pub[HSS_MAX_PUBLIC_KEY_LEN];
         int hdrLen;
         word32 needed;
+
+        if (object->keyData != NULL && object->keyDataLen > 0)
+            return 0;
 
         pubLen = sizeof(pub);
         ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels, &height,
@@ -6447,10 +6461,12 @@ static int wp11_Object_Decode_HssKey(WP11_Object* object)
             ret = wc_LmsKey_SetContext(object->data.lmsKey, object);
         if (ret == 0)
             ret = wc_LmsKey_Reload(object->data.lmsKey);
-        /* Reload does not restore key->pub; import the cached shell pub so
-         * ExportPubRaw/Sign stay consistent with the stored record. */
-        if (ret == 0)
-            ret = wc_LmsKey_ImportPubRaw(object->data.lmsKey, pub, pubLen);
+        /* Do NOT ImportPubRaw here: wolfSSL keeps an LmsKey in either signing
+         * (reloaded) or verify (pub) state, not both, and rejects a pub import
+         * after Reload with BAD_STATE_E. The public root is not needed for
+         * signing, and the cached shell (kept in keyData) preserves it for
+         * re-storage. */
+        (void)pub;
         if (ret == 0) {
             object->opFlag |= WP11_FLAG_STATEFUL_STATE_VALID;
             object->encoded = 0;
@@ -6527,6 +6543,22 @@ int WP11_Object_SetHssKey(WP11_Object* object, unsigned char** data,
 
     if (object == NULL || data == NULL || len == NULL)
         return BAD_FUNC_ARG;
+#ifdef WOLFPKCS11_LMS_PRIVATE
+    /* Keygen (C_GenerateKeyPair) creates both objects with no CKA_VALUE and
+     * populates them in WP11_Hss_GenerateKeyPair, so a missing value is a
+     * deferred keygen object, not an error. A private key must never be
+     * imported WITH a value: caller-supplied one-time-signature state is a
+     * forgery vector. */
+    if (object->objClass == CKO_PRIVATE_KEY) {
+        if (data[3] != NULL)
+            return BAD_FUNC_ARG;
+        return 0;
+    }
+    if (object->objClass != CKO_PUBLIC_KEY)
+        return BAD_FUNC_ARG;
+    if (data[3] == NULL)
+        return 0;
+#else
     if (object->objClass != CKO_PUBLIC_KEY)
         return BAD_FUNC_ARG;
     /* A public key must carry its value. There is no keygen path in a
@@ -6535,6 +6567,7 @@ int WP11_Object_SetHssKey(WP11_Object* object, unsigned char** data,
      * reject it instead of creating an unusable object. */
     if (data[3] == NULL)
         return BAD_FUNC_ARG;
+#endif
 
     if (object->onToken)
         WP11_Lock_LockRW(object->lock);
@@ -6784,6 +6817,19 @@ int WP11_Hss_Sign(unsigned char* data, word32 dataLen, unsigned char* sig,
     return ret;
 }
 
+/* Signature length for an HSS private key (parameter-set dependent). Returns
+ * 0 on error. */
+word32 WP11_Hss_SigLen(WP11_Object* key)
+{
+    word32 sigLen = 0;
+
+    if (key == NULL || key->data.lmsKey == NULL)
+        return 0;
+    if (wc_LmsKey_GetSigLen(key->data.lmsKey, &sigLen) != 0)
+        return 0;
+    return sigLen;
+}
+
 /* Remaining one-time keys for an HSS private key. Uses the wp11-layer
  * statefulSigCount (persisted in the GCM-authenticated state header) rather
  * than reaching into wolfSSL LmsKey internals. total = 2^(levels*height);
@@ -6932,12 +6978,34 @@ static int HssObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
             }
             break;
         }
-        case CKA_HSS_KEYS_REMAINING:
-            /* Remaining-signature count is a private-key/state property; not
-             * available in a verify-only build. Return NOT_AVAILABLE_E like the
-             * default arm; C_GetAttributeValue then sets ulValueLen. */
+        case CKA_HSS_KEYS_REMAINING: {
+            /* Remaining-signature count is a private-key/state property. In a
+             * verify-only build (or for a public key) it is unavailable. */
+#ifdef WOLFPKCS11_LMS_PRIVATE
+            if (object->objClass == CKO_PRIVATE_KEY) {
+                word32 remaining = 0;
+                CK_ULONG v;
+                if (WP11_Hss_SigsLeft(object, &remaining) != 0) {
+                    ret = NOT_AVAILABLE_E;
+                    break;
+                }
+                v = (CK_ULONG)remaining;
+                if (data == NULL)
+                    *len = sizeof(v);
+                else if (*len < sizeof(v)) {
+                    *len = sizeof(v);
+                    ret = BUFFER_E;
+                }
+                else {
+                    XMEMCPY(data, &v, sizeof(v));
+                    *len = sizeof(v);
+                }
+                break;
+            }
+#endif
             ret = NOT_AVAILABLE_E;
             break;
+        }
         case CKA_VALUE:
             if (object->objClass == CKO_PUBLIC_KEY) {
                 word32 pubLen = 0;

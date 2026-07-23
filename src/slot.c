@@ -384,6 +384,9 @@ static CK_MECHANISM_TYPE mechanismList[] = {
 #endif
 #ifdef WOLFPKCS11_LMS
     CKM_HSS,
+#ifdef WOLFPKCS11_LMS_PRIVATE
+    CKM_HSS_KEY_PAIR_GEN,
+#endif
 #endif
 #ifdef WOLFPKCS11_XMSS
     CKM_XMSS,
@@ -648,12 +651,22 @@ static CK_MECHANISM_INFO mldsaMechInfo = {
 };
 #endif
 #ifdef WOLFPKCS11_LMS
-/* Info on the HSS (LMS) verify mechanism. PKCS#11 does not define a key-size
- * semantics for stateful hash-based signatures (bits vs bytes), so report the
- * "not applicable" 0..0 envelope. Verify-only: no CKF_SIGN. */
+/* Info on the HSS (LMS) sign/verify mechanism. PKCS#11 does not define a
+ * key-size semantics for stateful hash-based signatures (bits vs bytes), so
+ * report the "not applicable" 0..0 envelope. CKF_SIGN is added only when
+ * keygen+signing is built in. */
 static CK_MECHANISM_INFO hssMechInfo = {
     0, 0, CKF_VERIFY
+#ifdef WOLFPKCS11_LMS_PRIVATE
+    | CKF_SIGN
+#endif
 };
+#ifdef WOLFPKCS11_LMS_PRIVATE
+/* Info on the HSS key-pair generation mechanism. */
+static CK_MECHANISM_INFO hssKgMechInfo = {
+    0, 0, CKF_GENERATE_KEY_PAIR
+};
+#endif
 #endif
 #ifdef WOLFPKCS11_XMSS
 /* Info on the XMSS / XMSS^MT verify mechanisms. 0..0 envelope, verify-only. */
@@ -1023,6 +1036,11 @@ CK_RV C_GetMechanismInfo(CK_SLOT_ID slotID, CK_MECHANISM_TYPE type,
         case CKM_HSS:
             XMEMCPY(pInfo, &hssMechInfo, sizeof(CK_MECHANISM_INFO));
             break;
+#ifdef WOLFPKCS11_LMS_PRIVATE
+        case CKM_HSS_KEY_PAIR_GEN:
+            XMEMCPY(pInfo, &hssKgMechInfo, sizeof(CK_MECHANISM_INFO));
+            break;
+#endif
 #endif
 #ifdef WOLFPKCS11_XMSS
         case CKM_XMSS:
