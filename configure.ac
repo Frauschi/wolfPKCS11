@@ -596,6 +596,42 @@ then
     AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_LMS"
 fi
 
+# LMS/HSS key generation and signing (EXPERIMENTAL). Stateful private keys:
+# a one-time signature leaf must never be reused, so signing durably persists
+# the advanced key state before releasing each signature. Implies --enable-lms
+# and requires a sign-capable wolfSSL LMS build (not --enable-lms=verify-only).
+AC_ARG_ENABLE([lms-private],
+    [AS_HELP_STRING([--enable-lms-private],[Enable LMS/HSS keygen and signing (EXPERIMENTAL, stateful private keys, default: disabled)])],
+    [ ENABLED_LMS_PRIVATE=$enableval ],
+    [ ENABLED_LMS_PRIVATE=no ]
+    )
+
+if test "$ENABLED_LMS_PRIVATE" = "yes" && test "$ENABLED_LMS" = "no"
+then
+    AC_MSG_NOTICE([--enable-lms-private implies --enable-lms; enabling])
+    ENABLED_LMS=yes
+    if test "$ENABLED_PKCS11V3_2" = "no"; then
+        ENABLED_PKCS11V3_2=yes
+        AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_2"
+        if test "$ENABLED_PKCS11V3_0" = "no"; then
+            ENABLED_PKCS11V3_0=yes
+            AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_0"
+        fi
+    fi
+    AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_LMS"
+fi
+
+if test "$ENABLED_SHA256" = "no" && test "$ENABLED_LMS_PRIVATE" = "yes"
+then
+    echo "LMS/HSS requires SHA-256 support (disabled), disabling LMS/HSS keygen+sign"
+    ENABLED_LMS_PRIVATE=no
+fi
+
+if test "$ENABLED_LMS_PRIVATE" = "yes"
+then
+    AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_LMS_PRIVATE"
+fi
+
 # XMSS/XMSS^MT (RFC 8391) verification and public-key import. Requires wolfSSL
 # built with --enable-xmss (WOLFSSL_HAVE_XMSS). Verify + public-key import only.
 AC_ARG_ENABLE([xmss],
@@ -815,6 +851,7 @@ echo "   * HKDF:                       $ENABLED_HKDF"
 echo "   * ML-DSA:                     $ENABLED_MLDSA"
 echo "   * ML-KEM:                     $ENABLED_MLKEM"
 echo "   * LMS/HSS verify:             $ENABLED_LMS"
+echo "   * LMS/HSS sign+keygen (EXP):  $ENABLED_LMS_PRIVATE"
 echo "   * XMSS/XMSS^MT verify:        $ENABLED_XMSS"
 echo "   * NSS modifications:          $ENABLED_NSS"
 echo "   * Default token path:         $WOLFPKCS11_DEFAULT_TOKEN_PATH"
