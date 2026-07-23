@@ -87,13 +87,14 @@ static byte* userPin = (byte*)"wolfpkcs11-test";
 static int userPinLen;
 
 #ifdef WOLFPKCS11_PKCS11_V3_2
-#if defined(WOLFPKCS11_MLDSA) || defined(WOLFPKCS11_MLKEM)
+#if defined(WOLFPKCS11_MLDSA) || defined(WOLFPKCS11_MLKEM) || \
+    defined(WOLFPKCS11_LMS) || defined(WOLFPKCS11_XMSS)
 
 static CK_BBOOL ckTrue = CK_TRUE;
 static CK_OBJECT_CLASS privKeyClass = CKO_PRIVATE_KEY;
 static CK_OBJECT_CLASS pubKeyClass = CKO_PUBLIC_KEY;
 
-#endif /* WOLFPKCS11_MLDSA || WOLFPKCS11_MLKEM */
+#endif /* MLDSA || MLKEM || LMS || XMSS */
 #ifdef WOLFPKCS11_MLDSA
 
 static CK_KEY_TYPE mldsaKeyType = CKK_ML_DSA;
@@ -2901,6 +2902,981 @@ static void pkcs11_close_session(int flags, void* args)
     }
 }
 
+#if defined(WOLFPKCS11_LMS) || defined(WOLFPKCS11_XMSS)
+/* ---- Stateful hash-based signature verify (LMS/HSS, XMSS/XMSS^MT) ----
+ * Known-answer verification tests. The public keys, signatures and message
+ * are defined in hbs_kat.h (shared with hbs_persistence_test.c); this
+ * verify-only feature imports the raw public key and checks the signature. */
+#include "hbs_kat.h"
+
+/* Import a raw HBS public key, verify a known-good signature (expect OK),
+ * flip one signature byte (expect CKR_SIGNATURE_INVALID), verify a
+ * wrong-length signature (expect CKR_SIGNATURE_INVALID, not a function
+ * failure), confirm C_CopyObject on the key is rejected, and confirm a second
+ * C_VerifyInit with no intervening C_Verify returns CKR_OPERATION_ACTIVE. */
+static CK_RV hbs_verify_kat(CK_SESSION_HANDLE session, CK_KEY_TYPE keyType,
+    CK_MECHANISM_TYPE mechType, const CK_BYTE* pub, CK_ULONG pubLen,
+    const CK_BYTE* sig, CK_ULONG sigLen)
+{
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_MECHANISM mech;
+    CK_BYTE* badSig;
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &pubKeyClass,  sizeof(pubKeyClass) },
+        { CKA_KEY_TYPE, &keyType,      sizeof(keyType)     },
+        { CKA_VERIFY,   &ckTrue,       sizeof(ckTrue)      },
+        { CKA_VALUE,    (CK_BYTE*)pub, pubLen              },
+    };
+
+    badSig = (CK_BYTE*)XMALLOC(sigLen, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    if (badSig == NULL)
+        return CKR_HOST_MEMORY;
+
+    mech.mechanism = mechType;
+    mech.pParameter = NULL;
+    mech.ulParameterLen = 0;
+
+    ret = funcList->C_CreateObject(session, tmpl,
+        sizeof(tmpl) / sizeof(*tmpl), &obj);
+    CHECK_CKR(ret, "HBS public key import");
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, obj);
+        CHECK_CKR(ret, "HBS C_VerifyInit");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Verify(session, hbs_kat_msg, HBS_KAT_MSG_LEN,
+            (CK_BYTE*)sig, sigLen);
+        CHECK_CKR(ret, "HBS C_Verify (valid signature)");
+    }
+    if (ret == CKR_OK) {
+        XMEMCPY(badSig, sig, sigLen);
+        badSig[sigLen / 2] ^= 0x01;
+        ret = funcList->C_VerifyInit(session, &mech, obj);
+        CHECK_CKR(ret, "HBS C_VerifyInit (tampered)");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Verify(session, hbs_kat_msg, HBS_KAT_MSG_LEN,
+            badSig, sigLen);
+        CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID,
+            "HBS tampered-signature verify");
+    }
+    if (ret == CKR_OK) {
+        /* A wrong-length signature must be reported as an invalid signature,
+         * not a function failure. */
+        ret = funcList->C_VerifyInit(session, &mech, obj);
+        CHECK_CKR(ret, "HBS C_VerifyInit (wrong length)");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Verify(session, hbs_kat_msg, HBS_KAT_MSG_LEN,
+            (CK_BYTE*)sig, sigLen - 1);
+        CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID,
+            "HBS wrong-length-signature verify");
+    }
+    if (ret == CKR_OK) {
+        /* Copy of a stateful HBS key is not supported; C_CopyObject must
+         * fail and create no object. */
+        CK_OBJECT_HANDLE copy = CK_INVALID_HANDLE;
+        CK_ATTRIBUTE copyTmpl[] = {
+            { CKA_LABEL, (CK_BYTE*)"hbs-copy", 8 },
+        };
+        CK_RV copyRet = funcList->C_CopyObject(session, obj, copyTmpl, 1,
+            &copy);
+        CHECK_COND(copyRet != CKR_OK, ret, "HBS C_CopyObject rejected");
+        if (copy != CK_INVALID_HANDLE)
+            funcList->C_DestroyObject(session, copy);
+    }
+    if (ret == CKR_OK) {
+        /* A second C_VerifyInit with no intervening C_Verify must return
+         * CKR_OPERATION_ACTIVE rather than silently resetting the operation. */
+        ret = funcList->C_VerifyInit(session, &mech, obj);
+        CHECK_CKR(ret, "HBS C_VerifyInit (active-guard first)");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, obj);
+        CHECK_CKR_FAIL(ret, CKR_OPERATION_ACTIVE,
+            "HBS second C_VerifyInit rejected");
+    }
+    if (ret == CKR_OK) {
+        /* The first operation is still active; drain it so teardown is clean. */
+        ret = funcList->C_Verify(session, hbs_kat_msg, HBS_KAT_MSG_LEN,
+            (CK_BYTE*)sig, sigLen);
+        CHECK_CKR(ret, "HBS C_Verify (drain active op)");
+    }
+
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    XFREE(badSig, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    return ret;
+}
+
+/* A stateful-HBS private-key import attempt must be rejected. */
+static CK_RV hbs_priv_import_rejected(CK_SESSION_HANDLE session,
+    CK_KEY_TYPE keyType, const CK_BYTE* pub, CK_ULONG pubLen)
+{
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &privKeyClass, sizeof(privKeyClass) },
+        { CKA_KEY_TYPE, &keyType,      sizeof(keyType)      },
+        { CKA_VALUE,    (CK_BYTE*)pub, pubLen               },
+    };
+
+    ret = funcList->C_CreateObject(session, tmpl,
+        sizeof(tmpl) / sizeof(*tmpl), &obj);
+    CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+        "HBS private-key import rejected");
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    return ret;
+}
+
+/* Keygen must be rejected in a verify-only build (mechanism not implemented). */
+static CK_RV hbs_keygen_rejected(CK_SESSION_HANDLE session,
+    CK_MECHANISM_TYPE kgMech)
+{
+    CK_RV ret;
+    CK_MECHANISM mech;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
+    CK_ATTRIBUTE pubTmpl[] = { { CKA_VERIFY, &ckTrue, sizeof(ckTrue) } };
+    CK_ATTRIBUTE privTmpl[] = { { CKA_SIGN, &ckTrue, sizeof(ckTrue) } };
+
+    mech.mechanism = kgMech;
+    mech.pParameter = NULL;
+    mech.ulParameterLen = 0;
+    ret = funcList->C_GenerateKeyPair(session, &mech, pubTmpl, 1,
+        privTmpl, 1, &pub, &priv);
+    CHECK_CKR_FAIL(ret, CKR_MECHANISM_INVALID,
+        "HBS keygen rejected in verify-only build");
+    return ret;
+}
+
+/* Import a raw public key and read CKA_VALUE back; it must round-trip byte
+ * for byte (verify-only export path). */
+static CK_RV hbs_getattr_value(CK_SESSION_HANDLE session, CK_KEY_TYPE keyType,
+    const CK_BYTE* pub, CK_ULONG pubLen)
+{
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_BYTE* out;
+    CK_ATTRIBUTE valTmpl[] = { { CKA_VALUE, NULL, 0 } };
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &pubKeyClass,  sizeof(pubKeyClass) },
+        { CKA_KEY_TYPE, &keyType,      sizeof(keyType)     },
+        { CKA_VERIFY,   &ckTrue,       sizeof(ckTrue)      },
+        { CKA_VALUE,    (CK_BYTE*)pub, pubLen              },
+    };
+
+    /* Size the read buffer to the key so every parameter set round-trips,
+     * including SHA-512 sets whose public key exceeds a small fixed buffer. */
+    out = (CK_BYTE*)malloc(pubLen);
+    if (out == NULL)
+        return CKR_HOST_MEMORY;
+
+    ret = funcList->C_CreateObject(session, tmpl,
+        sizeof(tmpl) / sizeof(*tmpl), &obj);
+    CHECK_CKR(ret, "HBS getattr key import");
+    /* Query length only first. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_GetAttributeValue(session, obj, valTmpl, 1);
+        CHECK_CKR(ret, "HBS CKA_VALUE length query");
+    }
+    if (ret == CKR_OK && valTmpl[0].ulValueLen != pubLen) {
+        ret = CKR_GENERAL_ERROR;
+        CHECK_CKR(ret, "HBS CKA_VALUE length mismatch");
+    }
+    if (ret == CKR_OK) {
+        valTmpl[0].pValue = out;
+        valTmpl[0].ulValueLen = pubLen;
+        ret = funcList->C_GetAttributeValue(session, obj, valTmpl, 1);
+        CHECK_CKR(ret, "HBS CKA_VALUE read");
+    }
+    if (ret == CKR_OK &&
+            (valTmpl[0].ulValueLen != pubLen ||
+             XMEMCMP(out, pub, pubLen) != 0)) {
+        ret = CKR_GENERAL_ERROR;
+        CHECK_CKR(ret, "HBS CKA_VALUE round-trip");
+    }
+
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    free(out);
+    return ret;
+}
+
+/* GetMechanismInfo for an HBS verify mechanism must advertise CKF_VERIFY and
+ * must not claim CKF_SIGN (verify-only build). */
+static CK_RV hbs_mech_info(CK_MECHANISM_TYPE mechType)
+{
+    CK_RV ret;
+    CK_MECHANISM_INFO info;
+
+    XMEMSET(&info, 0, sizeof(info));
+    ret = funcList->C_GetMechanismInfo(slot, mechType, &info);
+    CHECK_CKR(ret, "HBS C_GetMechanismInfo");
+    if (ret == CKR_OK && (info.flags & CKF_VERIFY) == 0) {
+        ret = CKR_GENERAL_ERROR;
+        CHECK_CKR(ret, "HBS mech info missing CKF_VERIFY");
+    }
+    if (ret == CKR_OK && (info.flags & CKF_SIGN) != 0) {
+        ret = CKR_GENERAL_ERROR;
+        CHECK_CKR(ret, "HBS mech info unexpectedly claims CKF_SIGN");
+    }
+    return ret;
+}
+
+/* A public key created without CKA_VALUE is an incomplete template and must be
+ * rejected rather than yielding an unusable object. */
+static CK_RV hbs_empty_template_rejected(CK_SESSION_HANDLE session,
+    CK_KEY_TYPE keyType)
+{
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &pubKeyClass, sizeof(pubKeyClass) },
+        { CKA_KEY_TYPE, &keyType,     sizeof(keyType)     },
+        { CKA_VERIFY,   &ckTrue,      sizeof(ckTrue)      },
+    };
+
+    ret = funcList->C_CreateObject(session, tmpl,
+        sizeof(tmpl) / sizeof(*tmpl), &obj);
+    CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+        "HBS empty-template public key rejected");
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    return ret;
+}
+
+/* A truncated (wrong-length) raw public key must be rejected as a bad
+ * attribute value, not surfaced as an internal failure. */
+static CK_RV hbs_bad_pubkey_len(CK_SESSION_HANDLE session, CK_KEY_TYPE keyType,
+    const CK_BYTE* pub, CK_ULONG pubLen)
+{
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &pubKeyClass,  sizeof(pubKeyClass) },
+        { CKA_KEY_TYPE, &keyType,      sizeof(keyType)     },
+        { CKA_VERIFY,   &ckTrue,       sizeof(ckTrue)      },
+        { CKA_VALUE,    (CK_BYTE*)pub, pubLen - 1          },
+    };
+
+    ret = funcList->C_CreateObject(session, tmpl,
+        sizeof(tmpl) / sizeof(*tmpl), &obj);
+    CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+        "HBS truncated public key rejected");
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    return ret;
+}
+#endif /* WOLFPKCS11_LMS || WOLFPKCS11_XMSS */
+
+
+#ifdef WOLFPKCS11_LMS
+
+static CK_RV test_hss_verify_kat(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    return hbs_verify_kat(session, CKK_HSS, CKM_HSS,
+        hss_kat_pub, sizeof(hss_kat_pub), hss_kat_sig, sizeof(hss_kat_sig));
+}
+
+static CK_RV test_hss_priv_import_rejected(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    return hbs_priv_import_rejected(session, CKK_HSS,
+        hss_kat_pub, sizeof(hss_kat_pub));
+}
+
+static CK_RV test_hss_verify_only_no_keygen(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    return hbs_keygen_rejected(session, CKM_HSS_KEY_PAIR_GEN);
+}
+
+static CK_RV test_hss_getattr_value(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    return hbs_getattr_value(session, CKK_HSS,
+        hss_kat_pub, sizeof(hss_kat_pub));
+}
+
+/* Read the LMS parameter attributes derived from the imported public key.
+ * hss_kat_pub is a single-level (L1) tree with LMS type H5 and LMOTS W4. */
+static CK_RV test_hss_getattr_params(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_ULONG levels = 0;
+    CK_LMS_TYPE lmsType = 0;
+    CK_LMOTS_TYPE lmotsType = 0;
+    CK_KEY_TYPE hssKeyType = CKK_HSS;
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &pubKeyClass,      sizeof(pubKeyClass)      },
+        { CKA_KEY_TYPE, &hssKeyType,       sizeof(hssKeyType)       },
+        { CKA_VERIFY,   &ckTrue,           sizeof(ckTrue)           },
+        { CKA_VALUE,    (CK_BYTE*)hss_kat_pub, sizeof(hss_kat_pub)  },
+    };
+    CK_ATTRIBUTE q[] = {
+        { CKA_HSS_LEVELS,     &levels,    sizeof(levels)    },
+        { CKA_HSS_LMS_TYPE,   &lmsType,   sizeof(lmsType)   },
+        { CKA_HSS_LMOTS_TYPE, &lmotsType, sizeof(lmotsType) },
+    };
+
+    ret = funcList->C_CreateObject(session, tmpl,
+        sizeof(tmpl) / sizeof(*tmpl), &obj);
+    CHECK_CKR(ret, "HSS params key import");
+    if (ret == CKR_OK) {
+        ret = funcList->C_GetAttributeValue(session, obj, q,
+            sizeof(q) / sizeof(*q));
+        CHECK_CKR(ret, "HSS params C_GetAttributeValue");
+    }
+    if (ret == CKR_OK && levels != 1) {
+        ret = CKR_GENERAL_ERROR;
+        CHECK_CKR(ret, "HSS CKA_HSS_LEVELS value");
+    }
+    if (ret == CKR_OK && lmsType != CKL_LMS_SHA256_M32_H5) {
+        ret = CKR_GENERAL_ERROR;
+        CHECK_CKR(ret, "HSS CKA_HSS_LMS_TYPE value");
+    }
+    if (ret == CKR_OK && lmotsType != CKL_LMOTS_SHA256_N32_W4) {
+        ret = CKR_GENERAL_ERROR;
+        CHECK_CKR(ret, "HSS CKA_HSS_LMOTS_TYPE value");
+    }
+
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    return ret;
+}
+
+/* Read the array-form HSS attributes and the keys-remaining state. hss_kat_pub
+ * is a single-level (L1) tree, so each array has one entry equal to the scalar
+ * top-level type; CKA_HSS_KEYS_REMAINING is a private-key/state property and is
+ * unavailable on a verify-only public key. */
+static CK_RV test_hss_getattr_array_params(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_ULONG lmsTypes[8];
+    CK_ULONG lmotsTypes[8];
+    CK_ULONG keysRemaining = 0;
+    CK_KEY_TYPE hssKeyType = CKK_HSS;
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &pubKeyClass,          sizeof(pubKeyClass) },
+        { CKA_KEY_TYPE, &hssKeyType,           sizeof(hssKeyType)  },
+        { CKA_VERIFY,   &ckTrue,               sizeof(ckTrue)      },
+        { CKA_VALUE,    (CK_BYTE*)hss_kat_pub, sizeof(hss_kat_pub) },
+    };
+    CK_ATTRIBUTE qArrays[] = {
+        { CKA_HSS_LMS_TYPES,   lmsTypes,   sizeof(lmsTypes)   },
+        { CKA_HSS_LMOTS_TYPES, lmotsTypes, sizeof(lmotsTypes) },
+    };
+    CK_ATTRIBUTE qRemaining[] = {
+        { CKA_HSS_KEYS_REMAINING, &keysRemaining, sizeof(keysRemaining) },
+    };
+
+    ret = funcList->C_CreateObject(session, tmpl,
+        sizeof(tmpl) / sizeof(*tmpl), &obj);
+    CHECK_CKR(ret, "HSS array-params key import");
+    if (ret == CKR_OK) {
+        ret = funcList->C_GetAttributeValue(session, obj, qArrays,
+            sizeof(qArrays) / sizeof(*qArrays));
+        CHECK_CKR(ret, "HSS array C_GetAttributeValue");
+    }
+    /* L1 tree: one CK_ULONG entry each, equal to the top-level H5 / W4 types. */
+    if (ret == CKR_OK && (qArrays[0].ulValueLen != sizeof(CK_ULONG) ||
+            lmsTypes[0] != CKL_LMS_SHA256_M32_H5)) {
+        ret = CKR_GENERAL_ERROR;
+        CHECK_CKR(ret, "HSS CKA_HSS_LMS_TYPES value");
+    }
+    if (ret == CKR_OK && (qArrays[1].ulValueLen != sizeof(CK_ULONG) ||
+            lmotsTypes[0] != CKL_LMOTS_SHA256_N32_W4)) {
+        ret = CKR_GENERAL_ERROR;
+        CHECK_CKR(ret, "HSS CKA_HSS_LMOTS_TYPES value");
+    }
+    if (ret == CKR_OK) {
+        /* Unavailable attribute: reported through ulValueLen, so the call's
+         * return code is not asserted here. */
+        (void)funcList->C_GetAttributeValue(session, obj, qRemaining, 1);
+        if (qRemaining[0].ulValueLen != CK_UNAVAILABLE_INFORMATION) {
+            ret = CKR_GENERAL_ERROR;
+            CHECK_CKR(ret, "HSS CKA_HSS_KEYS_REMAINING unavailable");
+        }
+    }
+
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    return ret;
+}
+
+/* CKA_HSS_LMS_TYPES / CKA_HSS_LMOTS_TYPES are read-only key-derived arrays and
+ * CKA_HSS_KEYS_REMAINING is a private-key/state property. Setting a mismatched
+ * or wrong-length array, or setting keys-remaining at all, must be rejected as
+ * an invalid attribute value rather than silently accepted; setting the array
+ * that matches the key (as read back) is accepted. Mirrors
+ * test_xmss_paramset_setattr_rejected for the XMSS counterpart. */
+static CK_RV test_hss_setattr_rejected(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_KEY_TYPE keyType = CKK_HSS;
+    CK_ULONG keysRemaining = 10;
+    CK_ULONG goodLms = CKL_LMS_SHA256_M32_H5;
+    CK_ULONG badLms = CKL_LMS_SHA256_M32_H10;
+    CK_ULONG twoLms[2];
+    CK_ATTRIBUTE importTmpl[] = {
+        { CKA_CLASS,    &pubKeyClass,          sizeof(pubKeyClass) },
+        { CKA_KEY_TYPE, &keyType,              sizeof(keyType)     },
+        { CKA_VERIFY,   &ckTrue,               sizeof(ckTrue)      },
+        { CKA_VALUE,    (CK_BYTE*)hss_kat_pub, sizeof(hss_kat_pub) },
+    };
+    CK_ATTRIBUTE setKeysRemaining[] = {
+        { CKA_HSS_KEYS_REMAINING, &keysRemaining, sizeof(keysRemaining) },
+    };
+    CK_ATTRIBUTE setBadArray[] = {
+        { CKA_HSS_LMS_TYPES, &badLms, sizeof(badLms) },
+    };
+    CK_ATTRIBUTE setWrongLenArray[] = {
+        { CKA_HSS_LMS_TYPES, twoLms, sizeof(twoLms) },
+    };
+    CK_ATTRIBUTE setGoodArray[] = {
+        { CKA_HSS_LMS_TYPES, &goodLms, sizeof(goodLms) },
+    };
+
+    twoLms[0] = CKL_LMS_SHA256_M32_H5;
+    twoLms[1] = CKL_LMS_SHA256_M32_H5;
+
+    ret = funcList->C_CreateObject(session, importTmpl,
+        sizeof(importTmpl) / sizeof(*importTmpl), &obj);
+    CHECK_CKR(ret, "HSS import for set-attr test");
+
+    /* Keys-remaining is a private-key/state property, not settable here. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_SetAttributeValue(session, obj, setKeysRemaining, 1);
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+            "HSS set CKA_HSS_KEYS_REMAINING rejected");
+    }
+    /* A per-level type that does not match the key is rejected. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_SetAttributeValue(session, obj, setBadArray, 1);
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+            "HSS set mismatched CKA_HSS_LMS_TYPES rejected");
+    }
+    /* An array whose length does not match the level count is rejected. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_SetAttributeValue(session, obj, setWrongLenArray, 1);
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+            "HSS set wrong-length CKA_HSS_LMS_TYPES rejected");
+    }
+    /* The array that matches the key (as read back) is accepted. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_SetAttributeValue(session, obj, setGoodArray, 1);
+        CHECK_CKR(ret, "HSS set matching CKA_HSS_LMS_TYPES accepted");
+    }
+
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    return ret;
+}
+
+static CK_RV test_hss_mech_info(void* args)
+{
+    (void)args;
+    return hbs_mech_info(CKM_HSS);
+}
+
+static CK_RV test_hss_empty_template_rejected(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    return hbs_empty_template_rejected(session, CKK_HSS);
+}
+
+static CK_RV test_hss_bad_pubkey_len(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    return hbs_bad_pubkey_len(session, CKK_HSS,
+        hss_kat_pub, sizeof(hss_kat_pub));
+}
+
+/* A structurally invalid public key of the correct length (here an unknown
+ * top-level LMS type) must be rejected as a bad attribute value, not surface as
+ * a function failure. Complements test_hss_bad_pubkey_len (wrong length). */
+static CK_RV test_hss_bad_pubkey_value(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_KEY_TYPE keyType = CKK_HSS;
+    CK_BYTE badPub[sizeof(hss_kat_pub)];
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &pubKeyClass, sizeof(pubKeyClass) },
+        { CKA_KEY_TYPE, &keyType,     sizeof(keyType)     },
+        { CKA_VERIFY,   &ckTrue,      sizeof(ckTrue)      },
+        { CKA_VALUE,    badPub,       sizeof(badPub)      },
+    };
+
+    /* Corrupt the top-level LMS type (bytes 4..7) to an unknown value. */
+    XMEMCPY(badPub, hss_kat_pub, sizeof(badPub));
+    badPub[4] = 0xFF;
+    badPub[5] = 0xFF;
+    badPub[6] = 0xFF;
+    badPub[7] = 0xFF;
+
+    ret = funcList->C_CreateObject(session, tmpl,
+        sizeof(tmpl) / sizeof(*tmpl), &obj);
+    CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+        "HSS structurally invalid public key rejected");
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    return ret;
+}
+
+/* Supplying the correct CKA_HSS_* parameter attributes on import must succeed;
+ * supplying a wrong one must be rejected. hss_kat_pub is L1/H5/W4. */
+static CK_RV test_hss_paramset_validate(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_KEY_TYPE keyType = CKK_HSS;
+    CK_ULONG levels = 1;
+    CK_LMS_TYPE lmsType = CKL_LMS_SHA256_M32_H5;
+    CK_LMOTS_TYPE lmotsType = CKL_LMOTS_SHA256_N32_W4;
+    CK_LMS_TYPE badLmsType = CKL_LMS_SHA256_M32_H10;
+    CK_ATTRIBUTE good[] = {
+        { CKA_CLASS,           &pubKeyClass,      sizeof(pubKeyClass)     },
+        { CKA_KEY_TYPE,        &keyType,          sizeof(keyType)         },
+        { CKA_VERIFY,          &ckTrue,           sizeof(ckTrue)          },
+        { CKA_HSS_LEVELS,      &levels,           sizeof(levels)          },
+        { CKA_HSS_LMS_TYPE,    &lmsType,          sizeof(lmsType)         },
+        { CKA_HSS_LMOTS_TYPE,  &lmotsType,        sizeof(lmotsType)       },
+        { CKA_VALUE,           (CK_BYTE*)hss_kat_pub, sizeof(hss_kat_pub) },
+    };
+    CK_ATTRIBUTE bad[] = {
+        { CKA_CLASS,           &pubKeyClass,      sizeof(pubKeyClass)     },
+        { CKA_KEY_TYPE,        &keyType,          sizeof(keyType)         },
+        { CKA_VERIFY,          &ckTrue,           sizeof(ckTrue)          },
+        { CKA_HSS_LMS_TYPE,    &badLmsType,       sizeof(badLmsType)      },
+        { CKA_VALUE,           (CK_BYTE*)hss_kat_pub, sizeof(hss_kat_pub) },
+    };
+
+    ret = funcList->C_CreateObject(session, good,
+        sizeof(good) / sizeof(*good), &obj);
+    CHECK_CKR(ret, "HSS import with matching CKA_HSS_* params");
+    if (obj != CK_INVALID_HANDLE) {
+        funcList->C_DestroyObject(session, obj);
+        obj = CK_INVALID_HANDLE;
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(session, bad,
+            sizeof(bad) / sizeof(*bad), &obj);
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+            "HSS import with mismatching CKA_HSS_LMS_TYPE rejected");
+        if (obj != CK_INVALID_HANDLE)
+            funcList->C_DestroyObject(session, obj);
+    }
+    return ret;
+}
+
+/* CKA_PARAMETER_SET carries the XMSS/XMSS^MT OID and does not apply to HSS
+ * (CKK_HSS) keys, which use the CKA_HSS_* attributes instead. Supplying it on
+ * an HSS object -- both on import and via C_SetAttributeValue -- must be
+ * rejected rather than silently accepted as a no-op. */
+static CK_RV test_hss_paramset_rejected(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_KEY_TYPE keyType = CKK_HSS;
+    CK_ULONG paramSet = 1;
+    CK_ATTRIBUTE setTmpl[] = {
+        { CKA_PARAMETER_SET, &paramSet, sizeof(paramSet) },
+    };
+    CK_ATTRIBUTE badImport[] = {
+        { CKA_CLASS,         &pubKeyClass,          sizeof(pubKeyClass) },
+        { CKA_KEY_TYPE,      &keyType,              sizeof(keyType)     },
+        { CKA_VERIFY,        &ckTrue,               sizeof(ckTrue)      },
+        { CKA_PARAMETER_SET, &paramSet,             sizeof(paramSet)    },
+        { CKA_VALUE,         (CK_BYTE*)hss_kat_pub, sizeof(hss_kat_pub) },
+    };
+    CK_ATTRIBUTE goodImport[] = {
+        { CKA_CLASS,         &pubKeyClass,          sizeof(pubKeyClass) },
+        { CKA_KEY_TYPE,      &keyType,              sizeof(keyType)     },
+        { CKA_VERIFY,        &ckTrue,               sizeof(ckTrue)      },
+        { CKA_VALUE,         (CK_BYTE*)hss_kat_pub, sizeof(hss_kat_pub) },
+    };
+
+    /* CKA_PARAMETER_SET in the import template must be rejected. */
+    ret = funcList->C_CreateObject(session, badImport,
+        sizeof(badImport) / sizeof(*badImport), &obj);
+    CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+        "HSS import with CKA_PARAMETER_SET rejected");
+    if (obj != CK_INVALID_HANDLE) {
+        funcList->C_DestroyObject(session, obj);
+        obj = CK_INVALID_HANDLE;
+    }
+
+    /* Setting CKA_PARAMETER_SET on a valid HSS object must be rejected too. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(session, goodImport,
+            sizeof(goodImport) / sizeof(*goodImport), &obj);
+        CHECK_CKR(ret, "HSS import for CKA_PARAMETER_SET set-attr test");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_SetAttributeValue(session, obj, setTmpl, 1);
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+            "HSS C_SetAttributeValue CKA_PARAMETER_SET rejected");
+    }
+
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    return ret;
+}
+
+/* A failed re-import via C_SetAttributeValue (a bad CKA_VALUE) must leave the
+ * existing key intact: the object still verifies its original signature. This
+ * exercises the atomic temporary-key swap in WP11_Object_SetHssKey. */
+static CK_RV test_hss_reimport_atomic(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_MECHANISM mech;
+    CK_KEY_TYPE keyType = CKK_HSS;
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &pubKeyClass,          sizeof(pubKeyClass) },
+        { CKA_KEY_TYPE, &keyType,              sizeof(keyType)     },
+        { CKA_VERIFY,   &ckTrue,               sizeof(ckTrue)      },
+        { CKA_VALUE,    (CK_BYTE*)hss_kat_pub, sizeof(hss_kat_pub) },
+    };
+    /* A truncated public key is an invalid re-import value. */
+    CK_ATTRIBUTE badVal[] = {
+        { CKA_VALUE, (CK_BYTE*)hss_kat_pub, sizeof(hss_kat_pub) - 1 },
+    };
+
+    mech.mechanism = CKM_HSS;
+    mech.pParameter = NULL;
+    mech.ulParameterLen = 0;
+
+    ret = funcList->C_CreateObject(session, tmpl,
+        sizeof(tmpl) / sizeof(*tmpl), &obj);
+    CHECK_CKR(ret, "HSS key import for re-import test");
+    if (ret == CKR_OK) {
+        ret = funcList->C_SetAttributeValue(session, obj, badVal, 1);
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+            "HSS re-import of invalid CKA_VALUE rejected");
+    }
+    if (ret == CKR_OK) {
+        /* The failed re-import must leave the original key usable. */
+        ret = funcList->C_VerifyInit(session, &mech, obj);
+        CHECK_CKR(ret, "HSS C_VerifyInit after failed re-import");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Verify(session, hbs_kat_msg, HBS_KAT_MSG_LEN,
+            (CK_BYTE*)hss_kat_sig, sizeof(hss_kat_sig));
+        CHECK_CKR(ret, "HSS verify after failed re-import");
+    }
+
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    return ret;
+}
+
+#ifdef WOLFPKCS11_XMSS
+/* CKM_HSS must reject a key whose type is not CKK_HSS. Pair it with an XMSS
+ * public key so C_VerifyInit's HSS mechanism/key-type guard is exercised
+ * directly (the cross-scheme counterpart of test_xmss_wrong_mech_keytype). */
+static CK_RV test_hss_wrong_mech_keytype(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_MECHANISM mech;
+    CK_KEY_TYPE xmssKeyType = CKK_XMSS;
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &pubKeyClass,           sizeof(pubKeyClass)  },
+        { CKA_KEY_TYPE, &xmssKeyType,           sizeof(xmssKeyType)  },
+        { CKA_VERIFY,   &ckTrue,                sizeof(ckTrue)       },
+        { CKA_VALUE,    (CK_BYTE*)xmss_kat_pub, sizeof(xmss_kat_pub) },
+    };
+
+    mech.mechanism = CKM_HSS;
+    mech.pParameter = NULL;
+    mech.ulParameterLen = 0;
+
+    ret = funcList->C_CreateObject(session, tmpl,
+        sizeof(tmpl) / sizeof(*tmpl), &obj);
+    CHECK_CKR(ret, "XMSS key import for HSS wrong-mech test");
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, obj);
+        CHECK_CKR_FAIL(ret, CKR_KEY_TYPE_INCONSISTENT,
+            "CKM_HSS mechanism rejects XMSS key");
+    }
+
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    return ret;
+}
+#endif /* WOLFPKCS11_XMSS */
+#endif /* WOLFPKCS11_LMS */
+
+
+#ifdef WOLFPKCS11_XMSS
+
+static CK_RV test_xmss_verify_kat(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    return hbs_verify_kat(session, CKK_XMSS, CKM_XMSS,
+        xmss_kat_pub, sizeof(xmss_kat_pub), xmss_kat_sig, sizeof(xmss_kat_sig));
+}
+
+static CK_RV test_xmssmt_verify_kat(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    return hbs_verify_kat(session, CKK_XMSSMT, CKM_XMSSMT,
+        xmssmt_kat_pub, sizeof(xmssmt_kat_pub),
+        xmssmt_kat_sig, sizeof(xmssmt_kat_sig));
+}
+
+static CK_RV test_xmss_priv_import_rejected(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    return hbs_priv_import_rejected(session, CKK_XMSS,
+        xmss_kat_pub, sizeof(xmss_kat_pub));
+}
+
+static CK_RV test_xmss_verify_only_no_keygen(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    return hbs_keygen_rejected(session, CKM_XMSS_KEY_PAIR_GEN);
+}
+
+static CK_RV test_xmss_getattr_value(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    return hbs_getattr_value(session, CKK_XMSS,
+        xmss_kat_pub, sizeof(xmss_kat_pub));
+}
+
+static CK_RV test_xmssmt_getattr_value(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    return hbs_getattr_value(session, CKK_XMSSMT,
+        xmssmt_kat_pub, sizeof(xmssmt_kat_pub));
+}
+
+static CK_RV test_xmss_mech_info(void* args)
+{
+    (void)args;
+    return hbs_mech_info(CKM_XMSS);
+}
+
+static CK_RV test_xmssmt_mech_info(void* args)
+{
+    (void)args;
+    return hbs_mech_info(CKM_XMSSMT);
+}
+
+static CK_RV test_xmss_empty_template_rejected(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    return hbs_empty_template_rejected(session, CKK_XMSS);
+}
+
+static CK_RV test_xmss_bad_pubkey_len(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    return hbs_bad_pubkey_len(session, CKK_XMSS,
+        xmss_kat_pub, sizeof(xmss_kat_pub));
+}
+
+/* A structurally invalid XMSS public key of the correct length (here an unknown
+ * parameter-set OID in the leading bytes) must be rejected as a bad attribute
+ * value, not a function failure. Complements test_xmss_bad_pubkey_len. */
+static CK_RV test_xmss_bad_pubkey_value(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_KEY_TYPE keyType = CKK_XMSS;
+    CK_BYTE badPub[sizeof(xmss_kat_pub)];
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &pubKeyClass, sizeof(pubKeyClass) },
+        { CKA_KEY_TYPE, &keyType,     sizeof(keyType)     },
+        { CKA_VERIFY,   &ckTrue,      sizeof(ckTrue)      },
+        { CKA_VALUE,    badPub,       sizeof(badPub)      },
+    };
+
+    /* Corrupt the leading parameter-set OID to an unknown value; length stays
+     * correct so this exercises the structural-rejection path. */
+    XMEMCPY(badPub, xmss_kat_pub, sizeof(badPub));
+    badPub[0] = 0xFF;
+    badPub[1] = 0xFF;
+    badPub[2] = 0xFF;
+    badPub[3] = 0xFF;
+
+    ret = funcList->C_CreateObject(session, tmpl,
+        sizeof(tmpl) / sizeof(*tmpl), &obj);
+    CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+        "XMSS structurally invalid public key rejected");
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    return ret;
+}
+
+/* A key created as CKK_XMSS must be rejected by the XMSS^MT mechanism:
+ * C_VerifyInit enforces the mechanism/key-type pairing. See
+ * test_hss_wrong_mech_keytype for the HSS counterpart. */
+static CK_RV test_xmss_wrong_mech_keytype(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_MECHANISM mech;
+    CK_KEY_TYPE xmssKeyType = CKK_XMSS;
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &pubKeyClass,          sizeof(pubKeyClass)     },
+        { CKA_KEY_TYPE, &xmssKeyType,          sizeof(xmssKeyType)     },
+        { CKA_VERIFY,   &ckTrue,               sizeof(ckTrue)          },
+        { CKA_VALUE,    (CK_BYTE*)xmss_kat_pub, sizeof(xmss_kat_pub)   },
+    };
+
+    mech.mechanism = CKM_XMSSMT;
+    mech.pParameter = NULL;
+    mech.ulParameterLen = 0;
+
+    ret = funcList->C_CreateObject(session, tmpl,
+        sizeof(tmpl) / sizeof(*tmpl), &obj);
+    CHECK_CKR(ret, "XMSS key import for wrong-mech test");
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, obj);
+        CHECK_CKR_FAIL(ret, CKR_KEY_TYPE_INCONSISTENT,
+            "XMSSMT mechanism rejects XMSS key");
+    }
+
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    return ret;
+}
+
+/* CKA_PARAMETER_SET (the XMSS OID) on import must match the public key: the
+ * matching OID succeeds and round-trips on read-back; a wrong OID is rejected.
+ * xmss_kat_pub carries OID 0x00000001 in its leading bytes. */
+static CK_RV test_xmss_paramset(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_KEY_TYPE keyType = CKK_XMSS;
+    CK_ULONG oid = 1;
+    CK_ULONG badOid = 2;
+    CK_ULONG readOid = 0;
+    CK_ATTRIBUTE q[] = { { CKA_PARAMETER_SET, &readOid, sizeof(readOid) } };
+    CK_ATTRIBUTE good[] = {
+        { CKA_CLASS,         &pubKeyClass,          sizeof(pubKeyClass)   },
+        { CKA_KEY_TYPE,      &keyType,              sizeof(keyType)       },
+        { CKA_VERIFY,        &ckTrue,               sizeof(ckTrue)        },
+        { CKA_PARAMETER_SET, &oid,                  sizeof(oid)           },
+        { CKA_VALUE,         (CK_BYTE*)xmss_kat_pub, sizeof(xmss_kat_pub) },
+    };
+    CK_ATTRIBUTE bad[] = {
+        { CKA_CLASS,         &pubKeyClass,          sizeof(pubKeyClass)   },
+        { CKA_KEY_TYPE,      &keyType,              sizeof(keyType)       },
+        { CKA_VERIFY,        &ckTrue,               sizeof(ckTrue)        },
+        { CKA_PARAMETER_SET, &badOid,               sizeof(badOid)        },
+        { CKA_VALUE,         (CK_BYTE*)xmss_kat_pub, sizeof(xmss_kat_pub) },
+    };
+
+    ret = funcList->C_CreateObject(session, good,
+        sizeof(good) / sizeof(*good), &obj);
+    CHECK_CKR(ret, "XMSS import with matching CKA_PARAMETER_SET");
+    if (ret == CKR_OK) {
+        ret = funcList->C_GetAttributeValue(session, obj, q, 1);
+        CHECK_CKR(ret, "XMSS CKA_PARAMETER_SET read-back");
+    }
+    if (ret == CKR_OK && (q[0].ulValueLen != sizeof(readOid) || readOid != 1)) {
+        ret = CKR_GENERAL_ERROR;
+        CHECK_CKR(ret, "XMSS CKA_PARAMETER_SET value");
+    }
+    if (obj != CK_INVALID_HANDLE) {
+        funcList->C_DestroyObject(session, obj);
+        obj = CK_INVALID_HANDLE;
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(session, bad,
+            sizeof(bad) / sizeof(*bad), &obj);
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+            "XMSS import with mismatching CKA_PARAMETER_SET rejected");
+        if (obj != CK_INVALID_HANDLE)
+            funcList->C_DestroyObject(session, obj);
+    }
+    return ret;
+}
+
+/* CKA_PARAMETER_SET on an existing XMSS object is derived from the key, not an
+ * independently settable value. A C_SetAttributeValue supplying a wrong OID
+ * (with or without CKA_VALUE) must be rejected rather than silently accepted,
+ * and the key-derived value must be left unchanged. The import path validates
+ * the OID against the key, so a lone CKA_PARAMETER_SET (no CKA_VALUE) is
+ * rejected too. xmss_kat_pub carries OID 1. */
+static CK_RV test_xmss_paramset_setattr_rejected(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_KEY_TYPE keyType = CKK_XMSS;
+    CK_ULONG badOid = 2;
+    CK_ULONG readOid = 0;
+    CK_ATTRIBUTE q[] = { { CKA_PARAMETER_SET, &readOid, sizeof(readOid) } };
+    CK_ATTRIBUTE importTmpl[] = {
+        { CKA_CLASS,    &pubKeyClass,          sizeof(pubKeyClass)  },
+        { CKA_KEY_TYPE, &keyType,              sizeof(keyType)      },
+        { CKA_VERIFY,   &ckTrue,               sizeof(ckTrue)       },
+        { CKA_VALUE,    (CK_BYTE*)xmss_kat_pub, sizeof(xmss_kat_pub) },
+    };
+    CK_ATTRIBUTE setBadOnly[] = {
+        { CKA_PARAMETER_SET, &badOid, sizeof(badOid) },
+    };
+    CK_ATTRIBUTE setBadWithVal[] = {
+        { CKA_PARAMETER_SET, &badOid,               sizeof(badOid)       },
+        { CKA_VALUE,         (CK_BYTE*)xmss_kat_pub, sizeof(xmss_kat_pub) },
+    };
+
+    ret = funcList->C_CreateObject(session, importTmpl,
+        sizeof(importTmpl) / sizeof(*importTmpl), &obj);
+    CHECK_CKR(ret, "XMSS import for set-attr test");
+
+    /* A wrong OID via C_SetAttributeValue must be rejected, not a no-op. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_SetAttributeValue(session, obj, setBadOnly, 1);
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+            "XMSS set wrong CKA_PARAMETER_SET rejected");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_SetAttributeValue(session, obj, setBadWithVal, 2);
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+            "XMSS set wrong CKA_PARAMETER_SET + value rejected");
+    }
+    /* The key-derived OID must be unchanged by the rejected sets. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_GetAttributeValue(session, obj, q, 1);
+        CHECK_CKR(ret, "XMSS CKA_PARAMETER_SET read-back after rejected set");
+    }
+    if (ret == CKR_OK && (q[0].ulValueLen != sizeof(readOid) || readOid != 1)) {
+        ret = CKR_GENERAL_ERROR;
+        CHECK_CKR(ret, "XMSS CKA_PARAMETER_SET unchanged after rejected set");
+    }
+
+    if (obj != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, obj);
+    return ret;
+}
+#endif /* WOLFPKCS11_XMSS */
+
+
 static TEST_FUNC testFunc[] = {
     PKCS11TEST_FUNC_NO_INIT_DECL(test_get_interface_list),
     PKCS11TEST_FUNC_NO_INIT_DECL(test_get_interface),
@@ -2935,6 +3911,41 @@ static TEST_FUNC testFunc[] = {
     PKCS11TEST_FUNC_SESS_DECL(test_mlkem_initial_states),
     PKCS11TEST_FUNC_SESS_DECL(test_mlkem_encap_decap_not_permitted),
     PKCS11TEST_FUNC_SESS_DECL(test_copy_object_mlkem_key),
+#endif
+#ifdef WOLFPKCS11_LMS
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_verify_kat),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_priv_import_rejected),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_verify_only_no_keygen),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_getattr_value),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_getattr_params),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_getattr_array_params),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_setattr_rejected),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_mech_info),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_empty_template_rejected),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_bad_pubkey_len),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_bad_pubkey_value),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_paramset_validate),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_paramset_rejected),
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_reimport_atomic),
+#endif
+#ifdef WOLFPKCS11_XMSS
+    PKCS11TEST_FUNC_SESS_DECL(test_xmss_verify_kat),
+    PKCS11TEST_FUNC_SESS_DECL(test_xmssmt_verify_kat),
+    PKCS11TEST_FUNC_SESS_DECL(test_xmss_priv_import_rejected),
+    PKCS11TEST_FUNC_SESS_DECL(test_xmss_verify_only_no_keygen),
+    PKCS11TEST_FUNC_SESS_DECL(test_xmss_getattr_value),
+    PKCS11TEST_FUNC_SESS_DECL(test_xmssmt_getattr_value),
+    PKCS11TEST_FUNC_SESS_DECL(test_xmss_mech_info),
+    PKCS11TEST_FUNC_SESS_DECL(test_xmssmt_mech_info),
+    PKCS11TEST_FUNC_SESS_DECL(test_xmss_empty_template_rejected),
+    PKCS11TEST_FUNC_SESS_DECL(test_xmss_bad_pubkey_len),
+    PKCS11TEST_FUNC_SESS_DECL(test_xmss_bad_pubkey_value),
+    PKCS11TEST_FUNC_SESS_DECL(test_xmss_wrong_mech_keytype),
+    PKCS11TEST_FUNC_SESS_DECL(test_xmss_paramset),
+    PKCS11TEST_FUNC_SESS_DECL(test_xmss_paramset_setattr_rejected),
+#endif
+#if defined(WOLFPKCS11_LMS) && defined(WOLFPKCS11_XMSS)
+    PKCS11TEST_FUNC_SESS_DECL(test_hss_wrong_mech_keytype),
 #endif
 #endif
 };

@@ -36,6 +36,14 @@
 #include <wolfssl/wolfcrypt/wc_mldsa.h>
 #endif
 
+#ifdef WOLFPKCS11_LMS
+#include <wolfssl/wolfcrypt/wc_lms.h>
+#endif
+
+#ifdef WOLFPKCS11_XMSS
+#include <wolfssl/wolfcrypt/wc_xmss.h>
+#endif
+
 #include <wolfpkcs11/pkcs11.h>
 #include <wolfpkcs11/version.h>
 
@@ -115,6 +123,14 @@ C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT"
 
 #if defined(WOLFPKCS11_MLKEM) && !defined(WOLFSSL_HAVE_MLKEM)
 #error Compiling with ML-KEM requires ML-KEM support in wolfSSL.
+#endif
+
+#if defined(WOLFPKCS11_LMS) && !defined(WOLFSSL_HAVE_LMS)
+#error Compiling with LMS/HSS requires LMS support in wolfSSL (--enable-lms).
+#endif
+
+#if defined(WOLFPKCS11_XMSS) && !defined(WOLFSSL_HAVE_XMSS)
+#error Compiling with XMSS requires XMSS support in wolfSSL (--enable-xmss).
 #endif
 
 /* We need the next two for NSS, just for storage, even if we have no algos */
@@ -277,6 +293,10 @@ C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT"
 #define WP11_INIT_TLS_MAC_VERIFY       0x0071
 #define WP11_INIT_MLDSA_SIGN           0x0080
 #define WP11_INIT_MLDSA_VERIFY         0x0081
+#define WP11_INIT_HSS_SIGN             0x0090 /* Reserved for future use */
+#define WP11_INIT_HSS_VERIFY           0x0091
+#define WP11_INIT_XMSS_SIGN            0x00A0 /* Reserved for future use */
+#define WP11_INIT_XMSS_VERIFY          0x00A1
 
 /* Operation categories for CKR_OPERATION_ACTIVE checks */
 #define WP11_OP_ENCRYPT                0
@@ -588,6 +608,22 @@ WP11_LOCAL int WP11_Mldsa_Sign(unsigned char* data, word32 dataLen, unsigned cha
 WP11_LOCAL int WP11_Mldsa_Verify(unsigned char* sig, word32 sigLen, unsigned char* data,
                                  word32 dataLen, int* stat, WP11_Object* pub,
                                  WP11_Session* session);
+
+#ifdef WOLFPKCS11_LMS
+WP11_LOCAL int WP11_Object_SetHssKey(WP11_Object* object, unsigned char** data,
+                                     CK_ULONG* len);
+WP11_LOCAL int WP11_Hss_Verify(unsigned char* sig, word32 sigLen,
+                               unsigned char* data, word32 dataLen, int* stat,
+                               WP11_Object* pub);
+#endif
+
+#ifdef WOLFPKCS11_XMSS
+WP11_LOCAL int WP11_Object_SetXmssKey(WP11_Object* object, unsigned char** data,
+                                      CK_ULONG* len);
+WP11_LOCAL int WP11_Xmss_Verify(unsigned char* sig, word32 sigLen,
+                                unsigned char* data, word32 dataLen, int* stat,
+                                WP11_Object* pub);
+#endif
 
 WP11_LOCAL int WP11_Dh_GenerateKeyPair(WP11_Object* pub, WP11_Object* priv,
                             WP11_Slot* slot);

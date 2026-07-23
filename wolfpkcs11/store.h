@@ -40,6 +40,10 @@
 #define WOLFPKCS11_STORE_MLDSAKEY_PUB   0x0D
 #define WOLFPKCS11_STORE_MLKEMKEY_PRIV  0x0E
 #define WOLFPKCS11_STORE_MLKEMKEY_PUB   0x0F
+#define WOLFPKCS11_STORE_HSSKEY_PRIV    0x10 /* Reserved for future use */
+#define WOLFPKCS11_STORE_HSSKEY_PUB     0x11
+#define WOLFPKCS11_STORE_XMSSKEY_PRIV   0x12 /* Reserved for future use */
+#define WOLFPKCS11_STORE_XMSSKEY_PUB    0x13
 
 /*
  * Opens access to location to read/write token data.
