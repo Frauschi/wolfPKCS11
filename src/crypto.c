@@ -5457,9 +5457,13 @@ CK_RV C_Sign(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                 return CKR_OPERATION_NOT_INITIALIZED;
 
             sigLen = WP11_Hss_SigLen(obj);
-            if (sigLen == 0)
+            if (sigLen == 0) {
+                /* Genuine failure - terminate the active signing operation. */
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             if (pSignature == NULL) {
+                /* Length query - operation remains active per PKCS#11. */
                 *pulSignatureLen = sigLen;
                 return CKR_OK;
             }
@@ -5468,10 +5472,14 @@ CK_RV C_Sign(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
 
             ret = WP11_Hss_Sign(pData, (word32)ulDataLen, pSignature, &sigLen,
                                 obj);
-            if (ret == NOT_AVAILABLE_E)
-                return CKR_DEVICE_ERROR;  /* poisoned; reload required */
-            if (ret != 0)
-                return CKR_FUNCTION_FAILED;
+            if (ret == NOT_AVAILABLE_E) {
+                /* Poisoned state; terminate the operation, reload required. */
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DEVICE_ERROR;
+            }
+            /* Other failures fall through to the shared cleanup below, which
+             * clears the op flag and maps ret < 0 to CKR_FUNCTION_FAILED
+             * (matching the RSA/ECC/ML-DSA arms). */
             *pulSignatureLen = sigLen;
             break;
 #endif
@@ -8233,6 +8241,11 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
     if (rv != CKR_OK && priv != NULL) {
         if (*phPrivateKey != CK_INVALID_HANDLE)
             WP11_Session_RemoveObject(session, priv);
+#ifdef WOLFPKCS11_LMS_PRIVATE
+        /* An HSS keygen writes a durable state file before this point; if a
+         * later step failed, remove it so it is not orphaned on disk. */
+        WP11_Hss_RemoveOrphanState(priv, WP11_Session_GetSlot(session));
+#endif
         WP11_Object_Free(priv);
     }
 

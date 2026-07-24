@@ -606,6 +606,15 @@ AC_ARG_ENABLE([lms-private],
     [ ENABLED_LMS_PRIVATE=no ]
     )
 
+# LMS/HSS is SHA-256 based. Check the dependency BEFORE the --enable-lms
+# implication below so a missing SHA-256 disables lms-private without leaving
+# --enable-lms turned on for a broken build.
+if test "$ENABLED_SHA256" = "no" && test "$ENABLED_LMS_PRIVATE" = "yes"
+then
+    echo "LMS/HSS requires SHA-256 support (disabled), disabling LMS/HSS keygen+sign"
+    ENABLED_LMS_PRIVATE=no
+fi
+
 if test "$ENABLED_LMS_PRIVATE" = "yes" && test "$ENABLED_LMS" = "no"
 then
     AC_MSG_NOTICE([--enable-lms-private implies --enable-lms; enabling])
@@ -619,12 +628,6 @@ then
         fi
     fi
     AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_LMS"
-fi
-
-if test "$ENABLED_SHA256" = "no" && test "$ENABLED_LMS_PRIVATE" = "yes"
-then
-    echo "LMS/HSS requires SHA-256 support (disabled), disabling LMS/HSS keygen+sign"
-    ENABLED_LMS_PRIVATE=no
 fi
 
 if test "$ENABLED_LMS_PRIVATE" = "yes"

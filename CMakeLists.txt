@@ -539,6 +539,14 @@ add_option("WOLFPKCS11_LMS_PRIVATE"
     "no" "yes;no"
 )
 
+# LMS/HSS is SHA-256 based. Check the dependency BEFORE the force-enable below
+# so a missing SHA-256 disables LMS_PRIVATE without leaving LMS enabled on its
+# own (the force-enable would otherwise turn LMS on for a broken build).
+if(WOLFPKCS11_LMS_PRIVATE AND NOT WOLFPKCS11_SHA256)
+    message(STATUS "LMS/HSS requires SHA-256 support (disabled); disabling WOLFPKCS11_LMS_PRIVATE")
+    override_cache(WOLFPKCS11_LMS_PRIVATE "no")
+endif()
+
 if(WOLFPKCS11_LMS_PRIVATE AND NOT WOLFPKCS11_LMS)
     message(STATUS "WOLFPKCS11_LMS_PRIVATE requires WOLFPKCS11_LMS — enabling WOLFPKCS11_LMS automatically")
     override_cache(WOLFPKCS11_LMS "yes")
@@ -551,11 +559,6 @@ if(WOLFPKCS11_LMS_PRIVATE AND NOT WOLFPKCS11_LMS)
         list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_PKCS11_V3_2")
     endif()
     list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_LMS")
-endif()
-
-if(WOLFPKCS11_LMS_PRIVATE AND NOT WOLFPKCS11_SHA256)
-    message(STATUS "LMS/HSS requires SHA-256 support (disabled); disabling WOLFPKCS11_LMS_PRIVATE")
-    override_cache(WOLFPKCS11_LMS_PRIVATE "no")
 endif()
 
 if(WOLFPKCS11_LMS_PRIVATE)

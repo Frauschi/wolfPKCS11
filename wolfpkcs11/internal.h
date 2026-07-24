@@ -146,13 +146,10 @@ C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT"
 #error WOLFPKCS11_LMS_PRIVATE is incompatible with WOLFPKCS11_TPM_STORE (encrypted state blobs exceed TPM NV capacity).
 #endif
 
-/* Shared stateful hash-based signature framework selectors. _ANY covers the
- * shell/byte utilities compiled in both verify-only and sign builds; _PRIVATE
- * gates the encrypted durable-state infrastructure (keygen + signing). Future
- * XMSS private-key support reuses the same framework. */
-#if defined(WOLFPKCS11_LMS)
-#define WOLFPKCS11_STATEFUL_SIG_ANY
-#endif
+/* Stateful hash-based signature framework selector. _PRIVATE gates the
+ * encrypted durable-state infrastructure (keygen + signing); it is compiled
+ * only in sign-capable builds. Future XMSS private-key support reuses the same
+ * framework. */
 #if defined(WOLFPKCS11_LMS_PRIVATE)
 #define WOLFPKCS11_STATEFUL_SIG_PRIVATE
 #endif
@@ -655,6 +652,7 @@ WP11_LOCAL int WP11_Hss_Sign(unsigned char* data, word32 dataLen,
                              WP11_Object* priv);
 WP11_LOCAL word32 WP11_Hss_SigLen(WP11_Object* key);
 WP11_LOCAL int WP11_Hss_SigsLeft(WP11_Object* key, word32* remaining);
+WP11_LOCAL void WP11_Hss_RemoveOrphanState(WP11_Object* priv, WP11_Slot* slot);
 #endif
 #endif
 

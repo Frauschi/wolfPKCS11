@@ -1874,18 +1874,24 @@ static int wolfPKCS11_Store_CloseAndReport(void* store)
     if (ctx != NULL) {
         int commitRet = 0;
         int fsyncFailed = 0;
+#if defined(WOLFPKCS11_LMS_PRIVATE) && !defined(_WIN32) && !defined(_MSC_VER)
+        int fd;
+#endif
 
         if (ctx->file != XBADFILE && ctx->file != NULL) {
 #ifdef WOLFPKCS11_LMS_PRIVATE
-            /* Durable mode: flush file data to disk before close so the
-             * rename in CommitTemp commits a fully-persisted file. */
+            /* Durable mode: flush file data to disk before close so the rename
+             * in CommitTemp commits a fully-persisted file. The explicit fsync
+             * is POSIX-only; on Windows durability comes from the atomic rename
+             * (MoveFileExA with MOVEFILE_WRITE_THROUGH) in CommitTemp, and MSVC
+             * has no fsync()/fileno(). */
             if (ctx->durable && ctx->is_write) {
                 (void)XFFLUSH(ctx->file);
-                {
-                    int fd = fileno(ctx->file);
-                    if (fd < 0 || fsync(fd) != 0)
-                        fsyncFailed = 1;
-                }
+#if !defined(_WIN32) && !defined(_MSC_VER)
+                fd = fileno(ctx->file);
+                if (fd < 0 || fsync(fd) != 0)
+                    fsyncFailed = 1;
+#endif
             }
 #endif
             XFCLOSE(ctx->file);
@@ -5504,16 +5510,15 @@ static int wp11_Object_Store_MlKemKey(WP11_Object* object, int tokenId,
  *     [u32 ctLen][ciphertext (privSz + 16-byte GCM tag)]
  */
 
-/* Big-endian u32 reader. Always built — used by verify-only shell parsing. */
+/* Big-endian byte helpers for encoding/decoding the AAD-bound state header
+ * and the shell trailer (compiled in sign builds only - the whole framework
+ * is gated by WOLFPKCS11_STATEFUL_SIG_PRIVATE above). */
 static word32 wp11_Stateful_ReadU32(const byte* p)
 {
     return ((word32)p[0] << 24) | ((word32)p[1] << 16)
          | ((word32)p[2] << 8)  |  (word32)p[3];
 }
 
-#ifdef WOLFPKCS11_STATEFUL_SIG_PRIVATE
-/* The remaining byte helpers are only needed for sign-capable schemes
- * (encoding/decoding the AAD-bound state header and the shell trailer). */
 static word64 wp11_Stateful_ReadU64(const byte* p)
 {
     return ((word64)p[0] << 56) | ((word64)p[1] << 48)
@@ -6034,8 +6039,7 @@ static int wp11_Stateful_PeekStateIdFromShell(int tokenId, int objId,
     return 0;
 }
 
-#endif /* WOLFPKCS11_STATEFUL_SIG_PRIVATE (inner) */
-#endif /* WOLFPKCS11_STATEFUL_SIG_PRIVATE (outer) */
+#endif /* WOLFPKCS11_STATEFUL_SIG_PRIVATE */
 #ifdef WOLFPKCS11_LMS
 /* ===========================================================================
  * LMS/HSS (RFC 8554): verification and public-key import.
@@ -6444,8 +6448,16 @@ static int wp11_Object_Decode_HssKey(WP11_Object* object)
             if (object->statefulStateId == 0)
                 ret = BAD_FUNC_ARG;
         }
+        /* INVALID_DEVID unconditionally (not object->devId): HSS stateful
+         * signing is software-only by design - HSM/device-backed LMS is out of
+         * scope. This must hold even when the slot has a real devId (a hardware-
+         * offload build), so it is pinned here rather than inheriting the slot
+         * default. A real devId would route to the crypto callback and make
+         * wc_LmsKey_Reload treat the key as HSM-backed and skip the read
+         * callback (a no-op), leaving the reloaded key with no private state -
+         * any later Sign would then reuse leaf index 0 or crash. */
         if (ret == 0)
-            ret = wc_LmsKey_Init(object->data.lmsKey, NULL, object->devId);
+            ret = wc_LmsKey_Init(object->data.lmsKey, NULL, INVALID_DEVID);
         if (ret == 0)
             ret = wc_LmsKey_SetParameters(object->data.lmsKey, levels, height,
                 winternitz);
@@ -6720,7 +6732,14 @@ int WP11_Hss_GenerateKeyPair(WP11_Object* pub, WP11_Object* priv,
     priv->onToken = 1;
     priv->statefulSigCount = 0;
 
-    ret = wc_LmsKey_Init(priv->data.lmsKey, NULL, priv->devId);
+    /* INVALID_DEVID unconditionally (not priv->devId): HSS stateful signing is
+     * software-only by design - HSM/device-backed LMS is out of scope - so this
+     * is pinned even when the slot has a real devId (a hardware-offload build),
+     * mirroring the reload path in wp11_Object_Decode_HssKey. A real devId would
+     * route MakeKey/Sign through the crypto callback and, critically, make a
+     * later wc_LmsKey_Reload a no-op, so the persisted state could never be
+     * restored. */
+    ret = wc_LmsKey_Init(priv->data.lmsKey, NULL, INVALID_DEVID);
     if (ret == 0)
         ret = wc_LmsKey_SetParameters(priv->data.lmsKey, nLevels, height,
             winternitz);
@@ -6770,6 +6789,22 @@ int WP11_Hss_GenerateKeyPair(WP11_Object* pub, WP11_Object* priv,
 
     wc_ForceZero(pubBuf, sizeof(pubBuf));
     return ret;
+}
+
+/* Remove the durable signature-state file backing an HSS private key that was
+ * generated but never committed to the token - e.g. a later C_GenerateKeyPair
+ * step (AddObject/SetInitialStates/store) failed after keygen already wrote the
+ * genesis state to disk. Without this the encrypted state file is orphaned.
+ * No-op unless priv is a CKK_HSS private key with a live state id; safe to call
+ * on any object and more than once. */
+void WP11_Hss_RemoveOrphanState(WP11_Object* priv, WP11_Slot* slot)
+{
+    if (priv != NULL && slot != NULL && priv->type == CKK_HSS &&
+            priv->objClass == CKO_PRIVATE_KEY && priv->statefulStateId != 0) {
+        (void)wp11_Stateful_StateFile_Remove("hsskey", (int)slot->id,
+            priv->statefulStateId);
+        priv->statefulStateId = 0;
+    }
 }
 
 /* Sign a raw message with an HSS private key. State is advanced and persisted
