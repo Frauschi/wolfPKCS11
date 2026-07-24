@@ -66,6 +66,9 @@
 
 #ifndef _WIN32
 #include <dirent.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 #ifndef WOLFPKCS11_DLL_FILENAME
@@ -998,6 +1001,299 @@ static CK_RV test_state_tamper_detected(void)
     pkcs11_final();
     return ret;
 }
+
+/* ---- Phase 3: state-write failure poisons the key; reload never advances
+ * past the last durable index. ---- */
+static CK_RV test_write_failure_poison(void)
+{
+    CK_RV ret, sret;
+    CK_SESSION_HANDLE session = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
+    static CK_BYTE id[] = "hss-wfail";
+    CK_BYTE* sig = NULL;
+    CK_ULONG sigLen = 0, before = 0, after = 0;
+
+    printf("  state-write failure poisons the key...\n");
+    ret = fresh_token(&session);
+    if (ret == CKR_OK) {
+        ret = gen_hss_key(session, hssLevels, hssLmsType, hssLmotsType,
+            id, sizeof(id) - 1, &pub, &priv);
+        CHECK_CKR(ret, "keygen");
+    }
+    /* One good signature establishes a durable baseline index on disk. */
+    if (ret == CKR_OK) {
+        ret = hss_sign(session, priv, &sig, &sigLen);
+        CHECK_CKR(ret, "baseline sign");
+        if (sig != NULL) {
+            XFREE(sig, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            sig = NULL;
+        }
+    }
+    if (ret == CKR_OK)
+        ret = get_keys_remaining(session, priv, &before);
+    /* Make the store directory unwritable so the durable state write fails. */
+    if (ret == CKR_OK && chmod(storeDir, 0500) != 0)
+        ret = CKR_GENERAL_ERROR;
+    if (ret == CKR_OK) {
+        sret = hss_sign(session, priv, &sig, &sigLen);
+        if (sret == CKR_OK) {
+            fprintf(stderr, "\nsigned despite an unwritable store - FAIL\n");
+            if (sig != NULL) {
+                XFREE(sig, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                sig = NULL;
+            }
+            ret = CKR_GENERAL_ERROR;
+        }
+        else {
+            printf("    write-failed sign refused: %lx\n", (unsigned long)sret);
+        }
+    }
+    (void)chmod(storeDir, 0700);   /* restore, even on failure */
+    /* The key is poisoned until reloaded: the next sign is CKR_DEVICE_ERROR. */
+    if (ret == CKR_OK) {
+        sret = hss_sign(session, priv, &sig, &sigLen);
+        CHECK_CKR_FAIL(sret, CKR_DEVICE_ERROR, "poisoned-key sign");
+        if (sig != NULL) {
+            XFREE(sig, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            sig = NULL;
+        }
+        if (sret != CKR_DEVICE_ERROR)
+            ret = CKR_GENERAL_ERROR;
+    }
+    /* Reload must recover to the last durable index - the failed write must not
+     * have advanced it. */
+    close_session(session);
+    session = CK_INVALID_HANDLE;
+    pkcs11_final();
+    if (ret == CKR_OK)
+        ret = reopen_token(&session);
+    if (ret == CKR_OK)
+        ret = find_by_id(session, CKO_PRIVATE_KEY, id, sizeof(id) - 1, &priv);
+    if (ret == CKR_OK)
+        ret = find_by_id(session, CKO_PUBLIC_KEY, id, sizeof(id) - 1, &pub);
+    if (ret == CKR_OK)
+        ret = get_keys_remaining(session, priv, &after);
+    if (ret == CKR_OK && after != before) {
+        fprintf(stderr, "\nreload advanced past a failed write: %lu -> %lu "
+            "- FAIL\n", (unsigned long)before, (unsigned long)after);
+        ret = CKR_GENERAL_ERROR;
+    }
+    /* And it still signs correctly from the recovered state. */
+    if (ret == CKR_OK)
+        ret = hss_sign(session, priv, &sig, &sigLen);
+    if (ret == CKR_OK)
+        ret = hss_verify(session, pub, sig, sigLen);
+    CHECK_CKR(ret, "post-recovery sign/verify");
+    if (sig != NULL)
+        XFREE(sig, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    close_session(session);
+    pkcs11_final();
+    return ret;
+}
+
+/* ---- Phase 3: per-sign durability survives an unclean exit. A forked child
+ * signs and _exit()s with NO C_Finalize; the parent confirms the state advanced
+ * durably and the consumed index is never reused. ---- */
+static CK_RV test_crash_durability(void)
+{
+    CK_RV ret;
+    CK_SESSION_HANDLE session = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
+    static CK_BYTE id[] = "hss-crash";
+    CK_BYTE* sig = NULL;
+    CK_ULONG sigLen = 0, before = 0, after = 0;
+    pid_t pid;
+    int status = 0;
+
+    printf("  per-sign durability survives an unclean exit (fork)...\n");
+    ret = fresh_token(&session);
+    if (ret == CKR_OK)
+        ret = gen_hss_key(session, hssLevels, hssLmsType, hssLmotsType,
+            id, sizeof(id) - 1, &pub, &priv);
+    if (ret == CKR_OK) {
+        ret = hss_sign(session, priv, &sig, &sigLen);
+        if (sig != NULL) {
+            XFREE(sig, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            sig = NULL;
+        }
+    }
+    if (ret == CKR_OK)
+        ret = get_keys_remaining(session, priv, &before);
+    close_session(session);
+    session = CK_INVALID_HANDLE;
+    pkcs11_final();
+    if (ret != CKR_OK)
+        return ret;
+
+    pid = fork();
+    if (pid == 0) {
+        /* Child: fresh process. Reload, sign once (durable), then hard-exit
+         * with no C_Finalize, simulating a crash right after a signature. */
+        CK_SESSION_HANDLE cs = CK_INVALID_HANDLE;
+        CK_OBJECT_HANDLE cp = CK_INVALID_HANDLE;
+        CK_BYTE* csig = NULL;
+        CK_ULONG cslen = 0;
+        CK_RV cret;
+
+        cret = reopen_token(&cs);
+        if (cret == CKR_OK)
+            cret = find_by_id(cs, CKO_PRIVATE_KEY, id, sizeof(id) - 1, &cp);
+        if (cret == CKR_OK)
+            cret = hss_sign(cs, cp, &csig, &cslen);
+        _exit(cret == CKR_OK ? 0 : 1);
+    }
+    if (pid < 0)
+        return CKR_GENERAL_ERROR;
+    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "\nchild sign failed (status %d) - FAIL\n", status);
+        return CKR_GENERAL_ERROR;
+    }
+
+    /* Parent: the child's signature must have durably advanced the state even
+     * though it never finalized, and the recovered index is exactly one past
+     * the parent's - never reused. */
+    ret = reopen_token(&session);
+    if (ret == CKR_OK)
+        ret = find_by_id(session, CKO_PRIVATE_KEY, id, sizeof(id) - 1, &priv);
+    if (ret == CKR_OK)
+        ret = find_by_id(session, CKO_PUBLIC_KEY, id, sizeof(id) - 1, &pub);
+    if (ret == CKR_OK)
+        ret = get_keys_remaining(session, priv, &after);
+    if (ret == CKR_OK && after != before - 1) {
+        fprintf(stderr, "\ncrash durability: remaining %lu -> %lu, expected a "
+            "drop of 1 - FAIL\n", (unsigned long)before, (unsigned long)after);
+        ret = CKR_GENERAL_ERROR;
+    }
+    if (ret == CKR_OK)
+        ret = hss_sign(session, priv, &sig, &sigLen);
+    if (ret == CKR_OK)
+        ret = hss_verify(session, pub, sig, sigLen);
+    CHECK_CKR(ret, "post-crash sign/verify");
+    if (sig != NULL)
+        XFREE(sig, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    close_session(session);
+    pkcs11_final();
+    return ret;
+}
+
+/* ---- Phase 3: on-disk state-file corruption matrix. ---- */
+#define CORRUPT_TRUNCATE 0
+#define CORRUPT_MAGIC    1
+#define CORRUPT_PARAM    2
+#define CORRUPT_TAG      3
+
+static CK_RV corrupt_state_and_check(const char* label, int type)
+{
+    CK_RV ret, sret;
+    CK_SESSION_HANDLE session = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
+    static CK_BYTE id[] = "hss-corrupt";
+    CK_BYTE* sig = NULL;
+    CK_ULONG sigLen = 0;
+    char statePath[512];
+    FILE* f;
+    long fsize = 0, off;
+    CK_BYTE b = 0;
+
+    printf("    [%s]...\n", label);
+    ret = fresh_token(&session);
+    if (ret == CKR_OK)
+        ret = gen_hss_key(session, hssLevels, hssLmsType, hssLmotsType,
+            id, sizeof(id) - 1, &pub, &priv);
+    if (ret == CKR_OK) {
+        ret = hss_sign(session, priv, &sig, &sigLen);
+        if (sig != NULL) {
+            XFREE(sig, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            sig = NULL;
+        }
+    }
+    if (ret == CKR_OK)
+        ret = find_state_file(statePath, sizeof(statePath));
+    close_session(session);
+    session = CK_INVALID_HANDLE;
+    pkcs11_final();
+    if (ret != CKR_OK)
+        return ret;
+
+    if (type == CORRUPT_TRUNCATE) {
+        f = fopen(statePath, "rb");
+        if (f == NULL)
+            return CKR_GENERAL_ERROR;
+        fseek(f, 0, SEEK_END);
+        fsize = ftell(f);
+        fclose(f);
+        if (truncate(statePath, fsize > 8 ? fsize - 8 : 0) != 0)
+            return CKR_GENERAL_ERROR;
+    }
+    else {
+        f = fopen(statePath, "rb+");
+        if (f == NULL)
+            return CKR_GENERAL_ERROR;
+        fseek(f, 0, SEEK_END);
+        fsize = ftell(f);
+        if (type == CORRUPT_MAGIC)
+            off = 0;                 /* header magic */
+        else if (type == CORRUPT_PARAM)
+            off = 12;                /* scheme-param bytes (AAD-bound) */
+        else
+            off = fsize - 1;         /* CORRUPT_TAG: last GCM tag byte */
+        fseek(f, off, SEEK_SET);
+        if (fread(&b, 1, 1, f) == 1) {
+            b ^= 0xFF;
+            fseek(f, off, SEEK_SET);
+            fwrite(&b, 1, 1, f);
+        }
+        else {
+            fclose(f);
+            return CKR_GENERAL_ERROR;
+        }
+        fclose(f);
+    }
+
+    /* Reload and attempt to use the key: it must be refused - detection may
+     * surface at login-time reload or at C_Sign - never a produced signature. */
+    ret = reopen_token_quiet(&session);
+    if (ret != CKR_OK) {
+        printf("      detected at login: %lx\n", (unsigned long)ret);
+        ret = CKR_OK;
+    }
+    else if (find_by_id(session, CKO_PRIVATE_KEY, id, sizeof(id) - 1, &priv)
+                 != CKR_OK) {
+        printf("      key not usable after corruption\n");
+    }
+    else {
+        sret = hss_sign(session, priv, &sig, &sigLen);
+        if (sret == CKR_OK) {
+            fprintf(stderr, "\n[%s] signed with corrupted state - FAIL\n",
+                label);
+            if (sig != NULL)
+                XFREE(sig, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            ret = CKR_GENERAL_ERROR;
+        }
+        else {
+            printf("      signing refused: %lx\n", (unsigned long)sret);
+        }
+    }
+    close_session(session);
+    pkcs11_final();
+    return ret;
+}
+
+static CK_RV test_corruption_matrix(void)
+{
+    CK_RV ret;
+
+    printf("  on-disk state corruption matrix...\n");
+    ret = corrupt_state_and_check("truncated", CORRUPT_TRUNCATE);
+    if (ret == CKR_OK)
+        ret = corrupt_state_and_check("bad magic", CORRUPT_MAGIC);
+    if (ret == CKR_OK)
+        ret = corrupt_state_and_check("bad scheme param", CORRUPT_PARAM);
+    if (ret == CKR_OK)
+        ret = corrupt_state_and_check("flipped GCM tag", CORRUPT_TAG);
+    return ret;
+}
 #endif /* !_WIN32 */
 
 /* ---- Phase 2: parameter matrix ---- */
@@ -1196,6 +1492,12 @@ static CK_RV run_all(void)
         ret = test_destroy_removes_state();
     if (ret == CKR_OK)
         ret = test_state_tamper_detected();
+    if (ret == CKR_OK)
+        ret = test_write_failure_poison();
+    if (ret == CKR_OK)
+        ret = test_crash_durability();
+    if (ret == CKR_OK)
+        ret = test_corruption_matrix();
 #endif
     return ret;
 }
