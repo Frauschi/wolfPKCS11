@@ -76,6 +76,33 @@ As ML-KEM is a feature of PKCS#11 version 3.2, support for that is required,
 too. Hence, to enable all in wolfPKCS11, add `--enable-pkcs11v32 --enable-mlkem`
 during the configure step.
 
+### Optional: LMS/HSS Hash-Based Signatures (RFC 8554)
+
+Verification and public-key import for LMS/HSS are enabled with `--enable-lms`
+(or `WOLFPKCS11_LMS=yes` in CMake) and require a wolfSSL build with LMS support
+(`--enable-lms`, `WOLFSSL_HAVE_LMS`). LMS/HSS is a feature of PKCS#11 version
+3.2, so that support is enabled automatically.
+
+Key generation and signing are **EXPERIMENTAL** and off by default. Enable them
+with `--enable-lms-private` (or `WOLFPKCS11_LMS_PRIVATE=yes` in CMake), which
+implies `--enable-lms` and requires a *sign-capable* wolfSSL LMS build (full
+`--enable-lms`, not `--enable-lms=verify-only`).
+
+LMS/HSS is a **stateful** signature scheme: every one-time-signature (OTS) leaf
+index must be used at most once, and reusing an index catastrophically breaks
+security. wolfPKCS11 therefore:
+
+* Requires stateful private keys to be token-resident (`CKA_TOKEN=TRUE`); a
+  session-only key that vanished on a crash could release a signature whose OTS
+  index was never persisted.
+* Durably persists the advanced key state (fsync plus atomic rename of an
+  encrypted, authenticated state file) *before* each signature is released, so a
+  crash or power loss cannot roll the OTS index backwards.
+
+Because the signature state is durable and per-key, do not clone, snapshot, or
+restore the token storage directory of a machine that signs with LMS/HSS keys -
+rolling the state files back to an earlier point would reuse OTS indices.
+
 ### Build options and defines
 
 #### Define WOLFPKCS11_TPM_STORE
@@ -267,6 +294,8 @@ cmake -DCMAKE_PREFIX_PATH=/path/to/wolfssl/install ..
 | `WOLFPKCS11_PKCS11_V3_2` | `no` | PKCS#11 v3.2 support |
 | `WOLFPKCS11_MLDSA` | `no` | ML-DSA support |
 | `WOLFPKCS11_MLKEM` | `no` | ML-KEM support |
+| `WOLFPKCS11_LMS` | `no` | LMS/HSS verification and public-key import |
+| `WOLFPKCS11_LMS_PRIVATE` | `no` | LMS/HSS keygen + signing (EXPERIMENTAL, stateful private keys) |
 | `WOLFPKCS11_EXAMPLES` | `yes` | Build examples |
 | `WOLFPKCS11_TESTS` | `yes` | Build and register tests |
 | `WOLFPKCS11_COVERAGE` | `no` | Code coverage support |
@@ -293,6 +322,15 @@ POSIX or `%APPDIR%\wolfPKCS11` on Windows), and finally the optional
 ### WOLFPKCS11_NO_STORE
 
 Set to any value to stop storage of token data.
+
+### WOLFPKCS11_STATEFUL_RELAX_FSYNC
+
+**Non-production only.** When set to `1`, wolfPKCS11 skips the `fsync()` calls
+(file and parent directory) that make LMS/HSS signature-state writes durable.
+This speeds up test runs on throwaway storage but is **dangerous**: after a
+crash or power loss the on-disk state can lag the signatures already released,
+leading to **OTS-key reuse**. Leave it unset (the default always fsyncs) in any
+real deployment. Only meaningful when built with `--enable-lms-private`.
 
 
 ## Release Notes
