@@ -139,6 +139,15 @@ jobs:
     with:
       config: --enable-lms-private --disable-shared
       wolfssl_lms: 'yes'
+  # Small-memory WC_LMS variant (WOLFSSL_WC_LMS_SMALL): different private-data
+  # sizing, so it exercises the state-file engine's dynamic sizing. Skip
+  # wolfSSL's own crypttests, which fail to link in this LMS config.
+  lms_private_small:
+    uses: ./.github/workflows/build-workflow.yml
+    with:
+      config: --enable-lms-private
+      wolfssl_lms: 'small'
+      wolfssl_extra: '--disable-crypttests'
   debug:
     uses: ./.github/workflows/build-workflow.yml
     with:
