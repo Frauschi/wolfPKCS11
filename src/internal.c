@@ -1880,14 +1880,17 @@ static int wolfPKCS11_Store_CloseAndReport(void* store)
 
         if (ctx->file != XBADFILE && ctx->file != NULL) {
 #ifdef WOLFPKCS11_LMS_PRIVATE
-            /* Durable mode: flush file data to disk before close so the rename
-             * in CommitTemp commits a fully-persisted file. The explicit fsync
-             * is POSIX-only; on Windows durability comes from the atomic rename
-             * (MoveFileExA with MOVEFILE_WRITE_THROUGH) in CommitTemp, and MSVC
-             * has no fsync()/fileno(). */
+            /* Durable mode: flush the file data to disk before close so the
+             * rename in CommitTemp commits a fully-persisted file. POSIX uses
+             * fsync(); Windows/MSVC uses _commit() (FlushFileBuffers under the
+             * hood) because MoveFileExA's MOVEFILE_WRITE_THROUGH makes only the
+             * rename durable, not the file data buffered before close. */
             if (ctx->durable && ctx->is_write) {
                 (void)XFFLUSH(ctx->file);
-#if !defined(_WIN32) && !defined(_MSC_VER)
+#if defined(_WIN32) || defined(_MSC_VER)
+                if (_commit(_fileno(ctx->file)) != 0)
+                    fsyncFailed = 1;
+#else
                 fd = fileno(ctx->file);
                 if (fd < 0 || fsync(fd) != 0)
                     fsyncFailed = 1;
