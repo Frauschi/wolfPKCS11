@@ -4639,13 +4639,16 @@ static int wp11_Object_Store_EccKey(WP11_Object* object, int tokenId, int objId)
 
 #ifdef WOLFPKCS11_MLDSA
 static int MldsaKeyTryDecode(wc_MlDsaKey* key, byte level, byte* data,
-                             word32 len, CK_OBJECT_CLASS class)
+                             word32 len, CK_OBJECT_CLASS class, int devId)
 {
     int ret = 0;
     word32 idx = 0;
 
-    /* Init key */
-    ret = wc_MlDsaKey_Init(key, NULL, INVALID_DEVID);
+    /* Init key with the object's devId (INVALID_DEVID for no-device builds via
+     * wp11_Slot_Init's default) so ML-DSA offloads to a configured
+     * crypto-callback device and falls through to software otherwise. Mirrors
+     * the import/copy paths, which already use the object devId. */
+    ret = wc_MlDsaKey_Init(key, NULL, devId);
 
     if (ret == 0) {
         /* Set level */
@@ -4699,14 +4702,16 @@ static int wp11_Object_Decode_MldsaKey(WP11_Object* object)
         if (ret == 0) {
             /* Decode ML-DSA private key. */
             ret = MldsaKeyTryDecode(object->data.mldsaKey, WC_ML_DSA_44,
-                                    der, len, object->objClass);
+                                    der, len, object->objClass, object->devId);
             if (ret != 0) {
                 ret = MldsaKeyTryDecode(object->data.mldsaKey, WC_ML_DSA_65,
-                                        der, len, object->objClass);
+                                        der, len, object->objClass,
+                                        object->devId);
             }
             if (ret != 0) {
                 ret = MldsaKeyTryDecode(object->data.mldsaKey, WC_ML_DSA_87,
-                                        der, len, object->objClass);
+                                        der, len, object->objClass,
+                                        object->devId);
             }
             wc_ForceZero(der, len);
         }
@@ -4717,16 +4722,16 @@ static int wp11_Object_Decode_MldsaKey(WP11_Object* object)
         /* Decode ML-DSA public key. */
         ret = MldsaKeyTryDecode(object->data.mldsaKey, WC_ML_DSA_44,
                                 object->keyData, object->keyDataLen,
-                                object->objClass);
+                                object->objClass, object->devId);
         if (ret != 0) {
             ret = MldsaKeyTryDecode(object->data.mldsaKey, WC_ML_DSA_65,
                                     object->keyData, object->keyDataLen,
-                                    object->objClass);
+                                    object->objClass, object->devId);
         }
         if (ret != 0) {
             ret = MldsaKeyTryDecode(object->data.mldsaKey, WC_ML_DSA_87,
                                     object->keyData, object->keyDataLen,
-                                    object->objClass);
+                                    object->objClass, object->devId);
         }
     }
     object->encoded = (ret != 0);
@@ -8908,6 +8913,12 @@ static int wp11_Slot_Init(WP11_Slot* slot, int id)
 
     XMEMSET(slot, 0, sizeof(*slot));
     slot->id = id;
+    /* Default to pure software. Must be INVALID_DEVID, not the 0 left by the
+     * XMEMSET above: 0 is a valid crypto-callback device slot, so a 0 devId
+     * routes every key through the crypto-callback dispatch even when no device
+     * is registered. The hardware-offload paths below override this with a real
+     * device id. */
+    slot->devId = INVALID_DEVID;
     slot->token.state = WP11_TOKEN_STATE_UNKNOWN;
     slot->token.tokenFlags = 0;
 
