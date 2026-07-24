@@ -6788,6 +6788,10 @@ int WP11_Hss_GenerateKeyPair(WP11_Object* pub, WP11_Object* priv,
     }
     else {
         wc_LmsKey_Free(priv->data.lmsKey);
+        /* Mark encoded so the C_GenerateKeyPair cleanup (WP11_Object_Free) does
+         * not free the wolfSSL key a second time; mirrors the failure path in
+         * wp11_Object_Decode_HssKey. */
+        priv->encoded = 1;
         if (stateWritten && priv->statefulStateId != 0) {
             (void)wp11_Stateful_StateFile_Remove("hsskey", (int)slot->id,
                 priv->statefulStateId);
