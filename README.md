@@ -103,6 +103,48 @@ Because the signature state is durable and per-key, do not clone, snapshot, or
 restore the token storage directory of a machine that signs with LMS/HSS keys -
 rolling the state files back to an earlier point would reuse OTS indices.
 
+#### Security model for stateful private keys
+
+Each HSS private key has a durable, per-key state file separate from the key
+object. Its layout is an AES-GCM ciphertext whose Additional Authenticated Data
+(AAD) binds the header magic, format version, scheme parameters (levels, LMS
+height, LMOTS Winternitz), and the running signature counter. A fresh random
+nonce is generated for every write. The private key material is encrypted with
+the token key (derived from the user PIN) and the decrypted buffers are cleared
+with `wc_ForceZero` on every path.
+
+What this **detects and refuses** (fail-closed):
+
+* In-place tampering or corruption of a state file - a flipped byte, a truncated
+  file, a wrong magic/version, or altered scheme parameters fails the AES-GCM
+  authentication (or the header check) at reload time, and the key will not
+  sign.
+* A signature-state write that does not become durable (fsync/rename failure) -
+  the key is poisoned in memory, the in-memory counter is reverted, and no
+  signature is released; a reload recovers to the last durable index and never
+  advances past the failed write.
+
+What this **cannot** protect against (inherent to any software-only stateful
+scheme - handle operationally):
+
+* **Offline state rollback.** Anyone who can copy the token directory and later
+  restore it - a filesystem backup/restore, a VM or container snapshot, `cp`,
+  or block-level replication - resets the OTS counter and causes one-time-key
+  **reuse**, which breaks the signatures irrecoverably. Only an HSM/TPM with a
+  hardware monotonic counter can prevent this, and that path is out of scope
+  here. Never restore or duplicate a signing machine's token directory.
+* **`WOLFPKCS11_STATEFUL_RELAX_FSYNC=1`.** This disables the durability fsyncs;
+  a crash or power loss can then leave the on-disk state behind the signatures
+  already released, reusing OTS keys. Non-production only.
+* **Concurrent use of one token directory from multiple processes.** State
+  durability and mutual exclusion are enforced within a single library instance;
+  two processes signing against the same on-disk token can reuse indices. Use
+  one signing process per token directory.
+
+HSS signing is not secret-input timing-sensitive the way an RSA/ECC private
+scalar is (the message and the tree position are not confidential), so no
+constant-time treatment beyond the existing token-key handling is required.
+
 ### Build options and defines
 
 #### Define WOLFPKCS11_TPM_STORE
