@@ -535,7 +535,7 @@ endif()
 
 # LMS/HSS keygen + signing (EXPERIMENTAL, stateful private keys; default: disabled)
 add_option("WOLFPKCS11_LMS_PRIVATE"
-    "Enable wolfPKCS11 LMS/HSS keygen and signing (EXPERIMENTAL, stateful private keys; default: disabled)"
+    "Enable wolfPKCS11 LMS/HSS keygen and signing (EXPERIMENTAL, stateful private keys, default: disabled)"
     "no" "yes;no"
 )
 
@@ -631,6 +631,7 @@ set(LIB_SOURCES
     src/wolfpkcs11.c
     src/slot.c
     src/crypto.c
+    src/hbs.c
 )
 if(BUILD_SHARED_LIBS)
     message(STATUS "BUILD_SHARED_LIBS enabled: ${LIB_SOURCES}")

@@ -267,12 +267,10 @@ C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT"
 #define WP11_FLAG_NOT_COPYABLE         0x00200000
 #define WP11_FLAG_NOT_DESTROYABLE      0x00400000
 #define WP11_FLAG_NOT_MODIFIABLE       0x00800000
-#ifdef WOLFPKCS11_STATEFUL_SIG_PRIVATE
 /* Set when a stateful private key's one-time-signature state is live and
  * usable; cleared ("poisoned") on any keygen/sign/reload failure so a
  * subsequent sign returns CKR_DEVICE_ERROR instead of risking OTS reuse. */
 #define WP11_FLAG_STATEFUL_STATE_VALID 0x01000000
-#endif
 
 /* Flags for token. */
 #define WP11_TOKEN_FLAG_USER_PIN_SET   0x00000001

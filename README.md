@@ -133,9 +133,12 @@ scheme - handle operationally):
   **reuse**, which breaks the signatures irrecoverably. Only an HSM/TPM with a
   hardware monotonic counter can prevent this, and that path is out of scope
   here. Never restore or duplicate a signing machine's token directory.
-* **`WOLFPKCS11_STATEFUL_RELAX_FSYNC=1`.** This disables the durability fsyncs;
-  a crash or power loss can then leave the on-disk state behind the signatures
-  already released, reusing OTS keys. Non-production only.
+* **`WOLFPKCS11_STATEFUL_RELAX_FSYNC=1`.** An opt-in environment variable that
+  trades durability for speed when running tests on throwaway storage, at the
+  cost of the guarantee above: a crash or power loss can then leave the on-disk
+  state behind the signatures already released, reusing OTS keys. It is never
+  set by default; leave it unset in any real deployment. See
+  [WOLFPKCS11_STATEFUL_RELAX_FSYNC](#wolfpkcs11_stateful_relax_fsync).
 * **Concurrent use of one token directory from multiple processes.** State
   durability and mutual exclusion are enforced within a single library instance;
   two processes signing against the same on-disk token can reuse indices. Use

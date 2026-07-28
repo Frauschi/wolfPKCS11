@@ -126,7 +126,7 @@ jobs:
     uses: ./.github/workflows/build-workflow.yml
     with:
       config: --enable-lms --enable-xmss --disable-shared
-  # EXPERIMENTAL LMS/HSS keygen + signing. Needs a sign-capable wolfSSL LMS
+  # LMS/HSS keygen + signing. Needs a sign-capable wolfSSL LMS
   # build (full --enable-lms, not verify-only); --enable-lms-private implies
   # --enable-lms on the wolfPKCS11 side.
   lms_private:

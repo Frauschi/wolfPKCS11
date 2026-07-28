@@ -5473,7 +5473,12 @@ CK_RV C_Sign(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
             ret = WP11_Hss_Sign(pData, (word32)ulDataLen, pSignature, &sigLen,
                                 obj);
             if (ret == NOT_AVAILABLE_E) {
-                /* Poisoned state; terminate the operation, reload required. */
+                /* The key's signature state was poisoned by an earlier
+                 * failure, so its in-memory leaf index can no longer be
+                 * trusted. Every further sign fails this way until the object
+                 * is re-read from the token (C_Logout/C_Login, or restarting
+                 * the application), which restores the state from the durable
+                 * state file. Terminate the operation. */
                 WP11_Session_SetOpInitialized(session, 0);
                 return CKR_DEVICE_ERROR;
             }
@@ -7824,6 +7829,97 @@ CK_RV C_GenerateKey(CK_SESSION_HANDLE hSession,
  *          type of operation.
  *          CKR_OK on success.
  */
+#ifdef WOLFPKCS11_LMS_PRIVATE
+/* Look up an attribute in the public-key template, falling back to the
+ * private-key one. The v3.3 HSS profile lets the caller supply the key
+ * parameters on either arm of C_GenerateKeyPair. */
+static CK_ATTRIBUTE_PTR HssFindGenAttr(CK_ATTRIBUTE_PTR pPublicKeyTemplate,
+                                       CK_ULONG ulPublicKeyAttributeCount,
+                                       CK_ATTRIBUTE_PTR pPrivateKeyTemplate,
+                                       CK_ULONG ulPrivateKeyAttributeCount,
+                                       CK_ATTRIBUTE_TYPE type)
+{
+    CK_ATTRIBUTE_PTR attr = NULL;
+
+    FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount, type,
+                      &attr);
+    if (attr == NULL) {
+        FindAttributeType(pPrivateKeyTemplate, ulPrivateKeyAttributeCount,
+                          type, &attr);
+    }
+    return attr;
+}
+
+/* True when the template holds CKA_TOKEN with the value CK_TRUE. */
+static int HssTemplateIsToken(CK_ATTRIBUTE_PTR pTemplate, CK_ULONG ulCount)
+{
+    CK_ATTRIBUTE_PTR attr = NULL;
+
+    FindAttributeType(pTemplate, ulCount, CKA_TOKEN, &attr);
+    return attr != NULL && attr->pValue != NULL &&
+           attr->ulValueLen == sizeof(CK_BBOOL) &&
+           *(CK_BBOOL*)attr->pValue == CK_TRUE;
+}
+
+/* Stateful keys must be token-resident: a session-only key that vanishes on a
+ * crash could release a signature whose one-time index was never persisted.
+ * Both arms of the key pair must ask for CKA_TOKEN=TRUE explicitly. */
+static CK_RV HssKeyPairGenCheckToken(CK_ATTRIBUTE_PTR pPublicKeyTemplate,
+                                     CK_ULONG ulPublicKeyAttributeCount,
+                                     CK_ATTRIBUTE_PTR pPrivateKeyTemplate,
+                                     CK_ULONG ulPrivateKeyAttributeCount)
+{
+    if (!HssTemplateIsToken(pPublicKeyTemplate, ulPublicKeyAttributeCount) ||
+        !HssTemplateIsToken(pPrivateKeyTemplate, ulPrivateKeyAttributeCount)) {
+        return CKR_TEMPLATE_INCONSISTENT;
+    }
+    return CKR_OK;
+}
+
+/* Collect the HSS parameter set (CKA_HSS_LEVELS, CKA_HSS_LMS_TYPE and
+ * CKA_HSS_LMOTS_TYPE) from the key templates. All three are required; each is
+ * a CK_ULONG-sized value.
+ *
+ * @return  CKR_TEMPLATE_INCOMPLETE when an attribute is absent.
+ * @return  CKR_ATTRIBUTE_VALUE_INVALID when one has no value or a bad length.
+ * @return  CKR_OK on success.
+ */
+static CK_RV HssKeyPairGenParams(CK_ATTRIBUTE_PTR pPublicKeyTemplate,
+                                 CK_ULONG ulPublicKeyAttributeCount,
+                                 CK_ATTRIBUTE_PTR pPrivateKeyTemplate,
+                                 CK_ULONG ulPrivateKeyAttributeCount,
+                                 CK_ULONG* levels, CK_LMS_TYPE* lmsType,
+                                 CK_LMOTS_TYPE* lmotsType)
+{
+    CK_ATTRIBUTE_PTR aLevels;
+    CK_ATTRIBUTE_PTR aLms;
+    CK_ATTRIBUTE_PTR aLmots;
+
+    aLevels = HssFindGenAttr(pPublicKeyTemplate, ulPublicKeyAttributeCount,
+        pPrivateKeyTemplate, ulPrivateKeyAttributeCount, CKA_HSS_LEVELS);
+    aLms = HssFindGenAttr(pPublicKeyTemplate, ulPublicKeyAttributeCount,
+        pPrivateKeyTemplate, ulPrivateKeyAttributeCount, CKA_HSS_LMS_TYPE);
+    aLmots = HssFindGenAttr(pPublicKeyTemplate, ulPublicKeyAttributeCount,
+        pPrivateKeyTemplate, ulPrivateKeyAttributeCount, CKA_HSS_LMOTS_TYPE);
+
+    if (aLevels == NULL || aLms == NULL || aLmots == NULL)
+        return CKR_TEMPLATE_INCOMPLETE;
+    if (aLevels->pValue == NULL ||
+            aLevels->ulValueLen != sizeof(CK_ULONG) ||
+            aLms->pValue == NULL ||
+            aLms->ulValueLen != sizeof(CK_ULONG) ||
+            aLmots->pValue == NULL ||
+            aLmots->ulValueLen != sizeof(CK_ULONG)) {
+        return CKR_ATTRIBUTE_VALUE_INVALID;
+    }
+
+    *levels = *(CK_ULONG*)aLevels->pValue;
+    *lmsType = *(CK_LMS_TYPE*)aLms->pValue;
+    *lmotsType = *(CK_LMOTS_TYPE*)aLmots->pValue;
+    return CKR_OK;
+}
+#endif /* WOLFPKCS11_LMS_PRIVATE */
+
 CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
                         CK_MECHANISM_PTR pMechanism,
                         CK_ATTRIBUTE_PTR pPublicKeyTemplate,
@@ -7865,7 +7961,7 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
         return rv;
     }
     /* Only require R/W session for token objects. Each template must be
-     * inspected independently — a public template with CKA_TOKEN=FALSE must
+     * inspected independently - a public template with CKA_TOKEN=FALSE must
      * not mask a private template requesting CKA_TOKEN=TRUE. */
     if (!WP11_Session_IsRW(session)) {
         CK_ATTRIBUTE_PTR tpls[2] = { pPublicKeyTemplate, pPrivateKeyTemplate };
@@ -7970,8 +8066,6 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
 #endif
 #ifdef WOLFPKCS11_LMS_PRIVATE
         case CKM_HSS_KEY_PAIR_GEN: {
-            CK_ATTRIBUTE_PTR aLevels = NULL, aLms = NULL, aLmots = NULL;
-            CK_ATTRIBUTE_PTR aTokPub = NULL, aTokPriv = NULL;
             CK_ULONG hssLevels;
             CK_LMS_TYPE hssLms;
             CK_LMOTS_TYPE hssLmots;
@@ -7981,51 +8075,17 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
                     pMechanism->ulParameterLen != 0) {
                 return CKR_MECHANISM_PARAM_INVALID;
             }
-            /* Stateful keys must be token-resident: a session-only key that
-             * vanishes on a crash could release a signature whose one-time
-             * index was never persisted. Require CKA_TOKEN=TRUE on both arms. */
-            FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount,
-                CKA_TOKEN, &aTokPub);
-            FindAttributeType(pPrivateKeyTemplate, ulPrivateKeyAttributeCount,
-                CKA_TOKEN, &aTokPriv);
-            if (aTokPub == NULL || aTokPub->pValue == NULL ||
-                    aTokPub->ulValueLen != sizeof(CK_BBOOL) ||
-                    *(CK_BBOOL*)aTokPub->pValue != CK_TRUE ||
-                    aTokPriv == NULL || aTokPriv->pValue == NULL ||
-                    aTokPriv->ulValueLen != sizeof(CK_BBOOL) ||
-                    *(CK_BBOOL*)aTokPriv->pValue != CK_TRUE) {
-                return CKR_TEMPLATE_INCONSISTENT;
-            }
-            /* Parameters come from the key template attributes (v3.3 HSS
-             * profile), accepted from either arm. */
-            FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount,
-                CKA_HSS_LEVELS, &aLevels);
-            if (aLevels == NULL)
-                FindAttributeType(pPrivateKeyTemplate,
-                    ulPrivateKeyAttributeCount, CKA_HSS_LEVELS, &aLevels);
-            FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount,
-                CKA_HSS_LMS_TYPE, &aLms);
-            if (aLms == NULL)
-                FindAttributeType(pPrivateKeyTemplate,
-                    ulPrivateKeyAttributeCount, CKA_HSS_LMS_TYPE, &aLms);
-            FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount,
-                CKA_HSS_LMOTS_TYPE, &aLmots);
-            if (aLmots == NULL)
-                FindAttributeType(pPrivateKeyTemplate,
-                    ulPrivateKeyAttributeCount, CKA_HSS_LMOTS_TYPE, &aLmots);
-            if (aLevels == NULL || aLms == NULL || aLmots == NULL)
-                return CKR_TEMPLATE_INCOMPLETE;
-            if (aLevels->pValue == NULL ||
-                    aLevels->ulValueLen != sizeof(CK_ULONG) ||
-                    aLms->pValue == NULL ||
-                    aLms->ulValueLen != sizeof(CK_ULONG) ||
-                    aLmots->pValue == NULL ||
-                    aLmots->ulValueLen != sizeof(CK_ULONG)) {
-                return CKR_ATTRIBUTE_VALUE_INVALID;
-            }
-            hssLevels = *(CK_ULONG*)aLevels->pValue;
-            hssLms = *(CK_LMS_TYPE*)aLms->pValue;
-            hssLmots = *(CK_LMOTS_TYPE*)aLmots->pValue;
+            rv = HssKeyPairGenCheckToken(pPublicKeyTemplate,
+                ulPublicKeyAttributeCount, pPrivateKeyTemplate,
+                ulPrivateKeyAttributeCount);
+            if (rv != CKR_OK)
+                return rv;
+
+            rv = HssKeyPairGenParams(pPublicKeyTemplate,
+                ulPublicKeyAttributeCount, pPrivateKeyTemplate,
+                ulPrivateKeyAttributeCount, &hssLevels, &hssLms, &hssLmots);
+            if (rv != CKR_OK)
+                return rv;
 
             *phPublicKey = *phPrivateKey = CK_INVALID_HANDLE;
             rv = NewObject(session, CKK_HSS, CKO_PUBLIC_KEY,

@@ -18,7 +18,7 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  *
- * Concurrency test for the EXPERIMENTAL sign-capable LMS/HSS build
+ * Concurrency test for the sign-capable LMS/HSS build
  * (--enable-lms-private). The one catastrophic failure mode of a stateful
  * hash-based scheme is two signers using the same one-time-signature (OTS)
  * leaf index. This test drives many threads signing concurrently with a single

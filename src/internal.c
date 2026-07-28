@@ -19,177 +19,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  */
 
-#ifdef HAVE_CONFIG_H
-    #include <wolfpkcs11/config.h>
-#endif
-#include "wolfpkcs11/pkcs11.h"
-
-#ifndef WOLFSSL_USER_SETTINGS
-#include <wolfssl/options.h>
-#else
-#include "user_settings.h"
-#endif
-
-#include <wolfssl/wolfcrypt/settings.h>
-#include <wolfssl/version.h>
-#include <wolfssl/wolfcrypt/pwdbased.h>
-#include <wolfssl/wolfcrypt/asn.h>
-#include <wolfssl/wolfcrypt/hash.h>
-#include <wolfssl/wolfcrypt/hmac.h>
-#include <wolfssl/wolfcrypt/ecc.h>
-#include <wolfssl/wolfcrypt/rsa.h>
-#include <wolfssl/wolfcrypt/asn_public.h>
-#include <wolfssl/wolfcrypt/aes.h>
-#include <wolfssl/wolfcrypt/cmac.h>
-#include <wolfssl/wolfcrypt/kdf.h>
-#ifdef WOLFPKCS11_MLKEM
-#include <wolfssl/wolfcrypt/wc_mlkem.h>
-#endif
-
-#if !defined(WOLFPKCS11_NO_STORE) && !defined(WOLFPKCS11_CUSTOM_STORE)
-/* OS-specific includes for directory creation */
-#if defined(_WIN32) || defined(_MSC_VER)
-    #include <direct.h>
-    #include <io.h>
-    #define MKDIR(path) _mkdir(path)
-#else
-    #include <sys/stat.h>
-    #define MKDIR(path) mkdir(path, 0700)
-#endif
-#endif
-
-#if !defined(WOLFPKCS11_NO_STORE) && !defined(WOLFPKCS11_CUSTOM_STORE)
-    #include <errno.h>
-    #include <time.h>
-    #if defined(_WIN32) || defined(_MSC_VER)
-        #include <windows.h>
-        #include <fcntl.h>
-        #include <sys/stat.h>
-        #include <process.h>
-    #else
-        #include <sys/types.h>
-        #include <fcntl.h>
-        #include <unistd.h>
-    #endif
-#endif
-
-#include <wolfpkcs11/internal.h>
-#include <wolfpkcs11/store.h>
-
-#ifdef WOLFPKCS11_TPM
-    #include <wolftpm/tpm2_wrap.h>
-    #include <wolftpm/version.h>
-
-    #ifndef WOLFPKCS11_TPM_CUST_IO
-        #include <hal/tpm_io.h>
-        #ifndef TPM2_IOCB_CTX
-        #define TPM2_IOCB_CTX NULL
-        #endif
-    #endif
-#endif
-
-#ifdef WOLFSSL_MAXQ10XX_CRYPTO
-#include <wolfpkcs11/port/maxim/MXQ_API.h>
-#include <wolfssl/wolfcrypt/asn.h>
-#define MAX_CERT_DATASIZE      2048
-#define MAX_SIG_DATASIZE       64
-#define ECC_KEYCOMPLEN         32
-#endif /* WOLFSSL_MAXQ10XX_CRYPTO */
-
-#if defined(WC_RSA_BLINDING) && (!defined(HAVE_FIPS) || \
-    (defined(HAVE_FIPS_VERSION) && (HAVE_FIPS_VERSION > 2)))
-#define WOLFPKCS11_NEED_RSA_RNG
-#endif
-
-#if defined(WOLFPKCS11_TPM) && defined(WOLFSSL_MAXQ10XX_CRYPTO)
-    #error "wolfTPM and MAXQ10XX are incompatible with each other."
-#endif
-
-/* Helper to get size of struct field */
-#define FIELD_SIZE(type, field) (sizeof(((type *)0)->field))
-
-/* Size of hash calculated from PIN. */
-#define PIN_HASH_SZ                    32
-/* Size of seed used when calculating hash from PIN. */
-#define PIN_SEED_SZ                    16
-/* Size of token's label. */
-#define LABEL_SZ                       32
-
-/* Length of seed from global random to seed local random. */
-#define RNG_SEED_SZ                    32
-
-
-
-/* Maximum size of storage for generated/derived DH key. */
-#ifdef WOLFPKCS11_NSS
-#define WP11_MAX_DH_KEY_SZ             (8192/8)
-#else
-#define WP11_MAX_DH_KEY_SZ             (4096/8)
-#endif
-
-/* Maximum size of storage for generated/derived symmetric key. */
-#ifdef WOLFPKCS11_NSS
-#define WP11_MAX_SYM_KEY_SZ            (2048)
-#elif !defined(NO_DH)
-#define WP11_MAX_SYM_KEY_SZ            (4096/8)
-#elif defined(HAVE_ECC)
-#define WP11_MAX_SYM_KEY_SZ            ((521+7)/8)
-#else
-#define WP11_MAX_SYM_KEY_SZ            64
-#endif
-
-#ifndef WP11_MAX_CERT_SZ
-#define WP11_MAX_CERT_SZ              4096
-#endif
-
-#define PKCS11_CHECK_VALUE_SIZE       3
-
-/* Sizes for storage. */
-#define WP11_MAX_IV_SZ                 16
-#define WP11_MAX_GCM_NONCE_SZ          16
-#define WP11_MAX_GCM_TAG_SZ            16
-#define WP11_MAX_GCM_TAG_BITS          128
-
-/* wolfSSL ECC signatures are ASN.1 encoding - need to encode and decode. */
-#define ASN_INTEGER                    0x02
-#define ASN_OCTET_STRING               0x04
-#define ASN_OBJECT_ID                  0x06
-#define ASN_SEQUENCE                   0x10
-#define ASN_CONSTRUCTED                0x20
-#define ASN_LONG_LENGTH                0x80
-
-/* Create a session handle from slot id and session id. */
-#define SESS_HANDLE(slot, s)           (((slot) << 16) | (s))
-/* Determine slot id from session handle. */
-#define SESS_HANDLE_SLOT_ID(s)         ((CK_SLOT_ID)((s) >> 16))
-/* Determine session id from session handle. */
-#define SESS_HANDLE_SESS_ID(s)         ((s) & 0xffff)
-
-/* Create an object handle from a onToken and object id. */
-#define OBJ_HANDLE(on, i)              (((on) << 28) | (i))
-/* Determine whether object is onToken from object handle. */
-#define OBJ_HANDLE_ON_TOKEN(h)         ((int)((h) >> 28))
-/* Determine object id from object handle. */
-#define OBJ_HANDLE_OBJ_ID(h)           ((h) & 0xfffffff)
-
-#ifdef SINGLE_THREADED
-/* Disable locking. */
-typedef int WP11_Lock;
-
-#define WP11_Lock_Init(l)              ({ 0; })
-#define WP11_Lock_Free(l)
-#define WP11_Lock_LockRW(l)            ({ 0; })
-#define WP11_Lock_UnlockRW(l)          ({ 0; })
-#define WP11_Lock_LockRO(l)            ({ 0; })
-#define WP11_Lock_UnlockRO(l)          ({ 0; })
-
-#else
-typedef struct WP11_Lock {
-    wolfSSL_Mutex read;                /* Mutex for accessing count           */
-    wolfSSL_Mutex write;               /* Mutex for writing                   */
-    int cnt;                           /* Count of readers                    */
-} WP11_Lock;
-#endif
+#include "wp11_types.h"
+#include "hbs.h"
 
 #ifdef DEBUG_WOLFPKCS11
 int wolfpkcs11_debugging = 0;
@@ -207,373 +38,6 @@ WP11_API void wolfPKCS11_Debugging_Off(void)
 }
 #endif
 
-
-/* Symmetric key data. */
-typedef struct WP11_Data {
-    byte data[WP11_MAX_SYM_KEY_SZ];    /* Key data                            */
-    word32 len;                        /* Length of key data in bytes         */
-} WP11_Data;
-
-typedef struct WP11_GenericData {
-    byte *data;
-    word32 dataLen;
-    byte *application;
-    word32 applicationLen;
-    byte *objectId;                    /* CKA_OBJECT_ID, a DER encoded ID     */
-    word32 objectIdLen;
-} WP11_GenericData;
-
-/* Certificate */
-typedef struct WP11_Cert {
-    byte *data;                        /* Certificate data                    */
-    word32 len;                        /* Length of certificate data in bytes */
-    CK_CERTIFICATE_TYPE type;
-} WP11_Cert;
-
-typedef struct WP11_Trust {
-    byte sha1Hash[WC_SHA_DIGEST_SIZE];
-    byte md5Hash[WC_MD5_DIGEST_SIZE];
-    CK_ULONG serverAuth;
-    CK_ULONG clientAuth;
-    CK_ULONG emailProtection;
-    CK_ULONG codeSigning;
-    CK_BBOOL stepUpApproved;
-} WP11_Trust;
-
-#ifndef NO_DH
-typedef struct WP11_DhKey {
-    byte key[WP11_MAX_DH_KEY_SZ];      /* Public or private key               */
-    word32 len;                        /* Length of public key                */
-    DhKey params;                      /* DH parameters object                */
-} WP11_DhKey;
-#endif
-
-/* When adding/modifying new members, add support in WP11_Object_Copy */
-struct WP11_Object {
-    union {
-    #ifndef NO_RSA
-        RsaKey* rsaKey;                /* RSA key object                      */
-    #endif
-    #ifdef HAVE_ECC
-        ecc_key* ecKey;                /* EC key object                       */
-    #endif
-    #ifdef WOLFPKCS11_MLDSA
-        wc_MlDsaKey* mldsaKey;            /* ML-DSA key object                   */
-    #endif
-    #ifndef NO_DH
-        WP11_DhKey* dhKey;             /* DH parameters object                */
-    #endif
-    #ifdef WOLFPKCS11_MLKEM
-        MlKemKey* mlKemKey;            /* ML-KEM key object                   */
-    #endif
-    #ifdef WOLFPKCS11_LMS
-        LmsKey* lmsKey;                /* LMS/HSS key object (verify)         */
-    #endif
-    #ifdef WOLFPKCS11_XMSS
-        XmssKey* xmssKey;              /* XMSS/XMSS^MT key object (verify)    */
-    #endif
-        WP11_Data* symmKey;            /* Symmetric key object                */
-        WP11_GenericData genericData;  /* Generic data object                 */
-        WP11_Cert cert;                /* Certificate object                  */
-    #ifdef WOLFPKCS11_NSS
-        WP11_Trust trust;              /* Trust object                        */
-    #endif
-    } data;
-#ifdef WOLFPKCS11_TPM
-    WOLFTPM2_KEYBLOB* tpmKey;
-#endif
-#ifdef WOLFSSL_STM32U5_DHUK
-    unsigned char* dhukIv; /* IV used with wrapping and unwrapping AES key.  */
-    int dhukIvLen;
-#endif
-    CK_KEY_TYPE type;                  /* Key type of this object             */
-    word32 size;                       /* Size of the key in bits or bytes    */
-#ifndef WOLFPKCS11_NO_STORE
-    unsigned char* keyData;            /* Encoded key data                    */
-    int keyDataLen;                    /* Length of encoded key data          */
-    byte iv[GCM_NONCE_MID_SZ];         /* IV/nonce for encrypt/decrypt        */
-    byte encoded:1;                    /* Key isn't in decoded form           */
-#endif
-
-    WP11_Session* session;             /* Session object belongs to           */
-    WP11_Slot* slot;                   /* Slot object belongs to              */
-
-    CK_OBJECT_HANDLE handle;           /* Handle of this object               */
-    CK_OBJECT_CLASS objClass;          /* Object class                        */
-    CK_MECHANISM_TYPE keyGenMech;      /* Key Gen mechanism created with      */
-    byte onToken:1;                    /* Object on token or session          */
-    byte local:1;                      /* Locally created object              */
-    word32 opFlag;                     /* Flags of operations allowed         */
-#ifdef WOLFPKCS11_STATEFUL_SIG_PRIVATE
-    word64 statefulStateId;            /* Non-zero nonce keying the durable   */
-                                       /* signature-state file (0 = none)     */
-    word64 statefulSigCount;           /* Signatures produced so far (bound   */
-                                       /* into the state-file AAD)            */
-#endif
-
-    char startDate[8];                 /* Start date of usage                 */
-    char endDate[8];                   /* End data of usage                   */
-
-    unsigned char* keyId;              /* Key identifier                      */
-    int keyIdLen;                      /* Length of key identifier            */
-    unsigned char* label;              /* Object label                        */
-    int labelLen;                      /* Length of object label              */
-    unsigned char* issuer;             /* Certificate issuer                  */
-    int issuerLen;                     /* Length of certificate issuer        */
-    unsigned char* serial;             /* Certificate serial number           */
-    int serialLen;                     /* Length of certificate serial number */
-    unsigned char* subject;            /* Subject of the object               */
-    int subjectLen;                    /* Length of subject                   */
-#ifdef WOLFPKCS11_NSS
-    unsigned char* email;              /* Certificate email (NSS extension)   */
-    int emailLen;                      /* Length of certificate email         */
-#endif
-
-    word32 category;                   /* Category of certificate             */
-
-    WP11_Lock* lock;                   /* Object specific lock                */
-
-    int devId;
-    WP11_Object* next;                 /* Next object in linked list          */
-};
-
-typedef struct WP11_Find {
-    int state;                         /* Whether operation is initialized    */
-    CK_OBJECT_HANDLE found[WP11_FIND_MAX];
-                                       /* List of object handles found        */
-    int count;                         /* Count of object handles             */
-    int curr;                          /* Index of last object returned       */
-} WP11_Find;
-
-#ifndef NO_RSA
-#ifndef WC_NO_RSA_OAEP
-typedef struct WP11_OaepParams {
-    enum wc_HashType hashType;         /* Type of hash algorithm              */
-    int mgf;                           /* Mask Generation Function            */
-    byte* label;                       /* Label or AAD                        */
-    int labelSz;                       /* Size of label in bytes              */
-} WP11_OaepParams;
-#endif
-
-#ifdef WC_RSA_PSS
-typedef struct WP11_PssParams {
-    enum wc_HashType hashType;
-    int mgf;
-    int saltLen;
-} WP11_PssParams;
-#endif
-#endif
-
-#ifdef WOLFPKCS11_MLDSA
-typedef struct WP11_MldsaParams {
-    enum wc_HashType preHashType;
-    word32 hedgeType;
-    byte ctx[256];
-    byte ctxSz;
-} WP11_MldsaParams;
-#endif
-
-#ifndef NO_AES
-#ifdef HAVE_AES_CBC
-typedef struct WP11_CbcParams {
-    unsigned char iv[WP11_MAX_IV_SZ];  /* IV of CBC operation                 */
-    Aes aes;                           /* AES object from wolfCrypt           */
-    unsigned char partial[AES_BLOCK_SIZE];
-                                       /* Partial block when streaming        */
-    byte partialSz;                    /* Size of partial block data          */
-} WP11_CbcParams;
-#endif
-
-#ifdef HAVE_AESCTR
-typedef struct WP11_CtrParams {
-    Aes aes;                           /* AES object from wolfCrypt           */
-} WP11_CtrParams;
-#endif
-
-#ifdef HAVE_AESGCM
-typedef struct WP11_GcmParams {
-    unsigned char iv[WP11_MAX_GCM_NONCE_SZ];
-                                       /* IV/nonce data                       */
-    int ivSz;                          /* IV/nonce size in bytes              */
-    unsigned char* aad;                /* Additional Authentication Data      */
-    int aadSz;                         /* AAD size in bytes                   */
-    int tagBits;                       /* Authentication tag size in bits     */
-    unsigned char authTag[WP11_MAX_GCM_TAG_SZ];
-                                       /* Authentication tag calculated       */
-    unsigned char* enc;                /* Cached data for multi-part: buffered */
-                                       /* ciphertext (decrypt) or, without     */
-                                       /* streaming GCM, plaintext (encrypt)   */
-    int encSz;                         /* Size of cached data in bytes         */
-#ifdef WOLFSSL_AESGCM_STREAM
-    Aes aes;                           /* Streaming context for multi-part    */
-                                       /* encrypt                             */
-    int streamInit;                    /* Streaming context is initialized    */
-#endif
-} WP11_GcmParams;
-#endif
-
-#ifdef HAVE_AESCCM
-typedef struct WP11_CcmParams {
-    int dataSz;                        /* Data size in bytes                  */
-    unsigned char iv[WP11_MAX_GCM_NONCE_SZ];
-                                       /* IV/nonce data                       */
-    int ivSz;                          /* IV/nonce size in bytes              */
-    unsigned char* aad;                /* Additional Authentication Data      */
-    int aadSz;                         /* AAD size in bytes                   */
-    int macSz;                         /* Size of MAC data in bytes           */
-} WP11_CcmParams;
-#endif
-
-#ifdef HAVE_AES_KEYWRAP
-typedef struct WP11_KeyWrapParams {
-    Aes aes;                           /* AES object from wolfCrypt           */
-    unsigned char iv[8];               /* IV/nonce data                       */
-    word32 ivSz;                       /* IV/nonce size in bytes              */
-} WP11_KeyWrapParams;
-#endif
-
-#ifdef HAVE_AESCTS
-typedef struct WP11_CtsParams {
-    unsigned char iv[WP11_MAX_IV_SZ];  /* IV of CBC operation                 */
-    Aes aes;                           /* AES object from wolfCrypt           */
-} WP11_CtsParams;
-#endif
-#endif
-
-#ifndef NO_HMAC
-typedef struct WP11_Hmac {
-    Hmac hmac;
-    word32 hmacSz;
-} WP11_Hmac;
-#endif
-
-typedef struct WP11_Digest {
-    wc_HashAlg hash;
-    enum wc_HashType hashType;
-} WP11_Digest;
-
-#ifdef HAVE_AESCMAC
-typedef struct WP11_Cmac {
-    Cmac cmac;
-    byte sigLen;
-} WP11_Cmac;
-#endif
-
-typedef struct WP11_TlsMacParams {
-    enum wc_MACAlgorithm mac;
-    word32 macSz;
-    CK_OBJECT_HANDLE key;
-    byte server:1;
-    byte isTlsPrf:1;
-} WP11_TlsMacParams;
-
-struct WP11_Session {
-    unsigned char inUse;               /* Indicates session has been opened   */
-    CK_SESSION_HANDLE handle;          /* CryptoKi API session handle value   */
-    CK_MECHANISM_TYPE mechanism;       /* Op that is being performed          */
-    CK_SLOT_ID slotId;                 /* Id of slot that session is on       */
-    WP11_Slot* slot;                   /* Slot that session is on             */
-    WP11_Object* object;               /* Linked list of objects on session   */
-    int objCnt;                        /* Count of objects in session         */
-    WP11_Object* curr;                 /* Current object                      */
-    WP11_Find find;                    /* Find data                           */
-    int init;                          /* Which op is initialized             */
-    union {
-#ifndef NO_RSA
-    #ifndef WC_NO_RSA_OAEP
-        WP11_OaepParams oaep;          /* RSA-OAEP parameters                 */
-    #endif
-    #ifdef WC_RSA_PSS
-        WP11_PssParams pss;            /* RSA-PSS parameters                  */
-    #endif
-#endif
-#ifdef WOLFPKCS11_MLDSA
-        WP11_MldsaParams mldsa;        /* ML-DSA parameters                   */
-#endif
-#ifndef NO_AES
-    #ifdef HAVE_AES_CBC
-        WP11_CbcParams cbc;            /* AES-CBC parameters                  */
-    #endif
-    #ifdef HAVE_AESCTR
-        WP11_CtrParams ctr;            /* AES-CTR parameters                  */
-    #endif
-    #ifdef HAVE_AESGCM
-        WP11_GcmParams gcm;            /* AES-GCM parameters                  */
-    #endif
-    #ifdef HAVE_AESCCM
-        WP11_CcmParams ccm;            /* AES-CCM parameters                  */
-    #endif
-    #ifdef HAVE_AESCTS
-        WP11_CtsParams cts;            /* AES-CTS parameters                  */
-    #endif
-    #ifdef HAVE_AES_KEYWRAP
-        WP11_KeyWrapParams kw;         /* AES-KW parameters                   */
-    #endif
-#endif
-#ifndef NO_HMAC
-        WP11_Hmac hmac;                /* HMAC parameters                     */
-#endif
-        WP11_Digest digest;            /* Digest parameters                   */
-#ifdef HAVE_AESCMAC
-        WP11_Cmac cmac;                /* CMAC parameters                     */
-#endif
-        WP11_TlsMacParams tlsMac;      /* TLS MAC parameters                  */
-    } params;
-
-    byte* data;                        /* Held data for one-shot mechs        */
-    word32 dataSz;                     /* Size of held data                   */
-
-    int devId;
-    WP11_Session* next;                /* Next session for slot               */
-};
-
-typedef struct WP11_Token {
-    char label[LABEL_SZ];              /* Token label                         */
-    int state;                         /* Token initialize state              */
-    byte soPin[PIN_HASH_SZ];           /* SO's PIN hashed with seed           */
-    int soPinLen;                      /* Used to indicate PIN set            */
-    byte soPinSeed[PIN_SEED_SZ];       /* Seed for calculating SO's PIN       */
-    int soFailedLogin;                 /* Count of consecutive failed logins  */
-    time_t soLastFailedLogin;          /* Time of last login if it failed     */
-    time_t soFailLoginTimeout;         /* Timeout after max login fails       */
-    byte userPin[PIN_HASH_SZ];         /* User's PIN hashed with seed         */
-    int userPinLen;                    /* Used to indicate PIN set            */
-    byte userPinSeed[PIN_SEED_SZ];     /* Seed for calculating user's PIN     */
-    int userFailedLogin;               /* Count of consecutive failed logins  */
-    time_t userLastFailedLogin;        /* Time of last login if it failed     */
-    time_t userFailLoginTimeout;       /* Timeout after max login fails       */
-#ifndef WOLFPKCS11_NO_STORE
-    byte seed[PIN_SEED_SZ];            /* Seed used to calculate key          */
-    byte key[AES_256_KEY_SIZE];        /* Key to en/decrypt private data      */
-#endif
-    WC_RNG rng;                        /* Random number generator             */
-    WP11_Lock rngLock;                 /* Lock for random access              */
-    WP11_Lock lock;                    /* Lock for object access              */
-    int loginState;                    /* Login state of the token            */
-    WP11_Object* object;               /* Linked list of token objects        */
-    int objCnt;                        /* Count of objects on token           */
-    int tokenFlags;                    /* Flags for token                     */
-    int nextObjId;
-    byte userPinEmpty:2;               /* Indicates user PIN is empty
-                                        * 0 = not set
-                                        * 1 = empty
-                                        * 2 = not empty                       */
-} WP11_Token;
-
-struct WP11_Slot {
-    CK_SLOT_ID id;                     /* CryptoKi API slot id value          */
-    WP11_Token token;                  /* Token information for slot          */
-    WP11_Session* session;             /* Linked list of sessions             */
-    WP11_Lock lock;                    /* Lock for access to slot info        */
-
-    int devId;
-#ifdef WOLFPKCS11_TPM
-    WOLFTPM2_DEV tpmDev;
-    WOLFTPM2_KEY tpmSrk;
-    WOLFTPM2_SESSION tpmSession;
-    TpmCryptoDevCtx  tpmCtx;
-#endif
-};
 
 #if defined(HAVE_FIPS) && FIPS_VERSION_LT(6,0)
 #define USE_LOCAL_CURVE_OID_LOOKUP
@@ -698,7 +162,7 @@ static void WP11_Lock_Free(WP11_Lock* lock)
  * @return  BAD_MUTEX_E on failure.
  *          0 on success.
  */
-static int WP11_Lock_LockRW(WP11_Lock* lock)
+int WP11_Lock_LockRW(WP11_Lock* lock)
 {
     int ret;
 
@@ -717,7 +181,7 @@ static int WP11_Lock_LockRW(WP11_Lock* lock)
  * @return  BAD_MUTEX_E on failure.
  *          0 on success.
  */
-static int WP11_Lock_UnlockRW(WP11_Lock* lock)
+int WP11_Lock_UnlockRW(WP11_Lock* lock)
 {
     int ret;
 
@@ -738,7 +202,7 @@ static int WP11_Lock_UnlockRW(WP11_Lock* lock)
  * @return  BAD_MUTEX_E on failure.
  *          0 on success.
  */
-static int WP11_Lock_LockRO(WP11_Lock* lock)
+int WP11_Lock_LockRO(WP11_Lock* lock)
 {
     int ret;
 
@@ -765,7 +229,7 @@ static int WP11_Lock_LockRO(WP11_Lock* lock)
  * @return  BAD_MUTEX_E on failure.
  *          0 on success.
  */
-static int WP11_Lock_UnlockRO(WP11_Lock* lock)
+int WP11_Lock_UnlockRO(WP11_Lock* lock)
 {
     int ret;
 
@@ -786,7 +250,7 @@ static int WP11_Lock_UnlockRO(WP11_Lock* lock)
 }
 #endif
 
-static int Rng_New(WC_RNG* baseRng, WP11_Lock* lock, WC_RNG* rng)
+int Rng_New(WC_RNG* baseRng, WP11_Lock* lock, WC_RNG* rng)
 {
     int ret;
     unsigned char seed[RNG_SEED_SZ];
@@ -802,7 +266,7 @@ static int Rng_New(WC_RNG* baseRng, WP11_Lock* lock, WC_RNG* rng)
     return ret;
 }
 
-static void Rng_Free(WC_RNG* rng)
+void Rng_Free(WC_RNG* rng)
 {
     wc_FreeRng(rng);
 }
@@ -1179,18 +643,18 @@ typedef struct WP11_FileStoreCtx {
     XFILE file;
     int   is_write;
     int   has_temp;
-#ifdef WOLFPKCS11_LMS_PRIVATE
+#ifdef WOLFPKCS11_STATEFUL_SIG_PRIVATE
     int   durable;   /* fsync file + directory before commit succeeds */
 #endif
     char  final_name[WP11_STORE_MAX_PATH];
     char  temp_name[WP11_STORE_MAX_PATH];
 } WP11_FileStoreCtx;
 
-#ifdef WOLFPKCS11_LMS_PRIVATE
+#ifdef WOLFPKCS11_STATEFUL_SIG_PRIVATE
 /* Mark a write-mode file storage context as requiring full durability (fsync
  * of file data + parent directory) before the close path returns success.
  * Call after the store is opened for write, before writing. */
-static void wolfPKCS11_Store_SetDurable(void* store, int durable)
+void wolfPKCS11_Store_SetDurable(void* store, int durable)
 {
 #ifndef WOLFPKCS11_TPM_STORE
     WP11_FileStoreCtx* ctx = (WP11_FileStoreCtx*)store;
@@ -1202,6 +666,42 @@ static void wolfPKCS11_Store_SetDurable(void* store, int durable)
 #endif
 }
 #endif
+
+/* Copy the directory part of path into dirPath, without the trailing
+ * separator. A path with no separator has no directory to return, and one
+ * whose only separator is the leading character names the filesystem root,
+ * which is never a usable token directory - both are rejected.
+ *
+ * @param  path        [in]   Full path to a file.
+ * @param  dirPath     [out]  Buffer receiving the directory part.
+ * @param  dirPathLen  [in]   Size of dirPath in bytes.
+ * @return  READ_ONLY_E when there is no directory part or it does not fit.
+ *          0 on success.
+ */
+static int wolfPKCS11_StoreDirName(const char* path, char* dirPath,
+                                   int dirPathLen)
+{
+    int len;
+    int slash = -1;
+    int i;
+
+    if (path == NULL || dirPath == NULL)
+        return READ_ONLY_E;
+
+    len = (int)XSTRLEN(path);
+    for (i = len - 1; i >= 0; i--) {
+        if (path[i] == '/' || path[i] == '\\') {
+            slash = i;
+            break;
+        }
+    }
+    if (slash <= 0 || slash >= dirPathLen)
+        return READ_ONLY_E;
+
+    XMEMCPY(dirPath, path, slash);
+    dirPath[slash] = '\0';
+    return 0;
+}
 
 static void wolfPKCS11_StoreAbortTemp(WP11_FileStoreCtx* ctx)
 {
@@ -1228,32 +728,15 @@ static int wolfPKCS11_StoreCommitTemp(WP11_FileStoreCtx* ctx)
     if (rename(ctx->temp_name, ctx->final_name) != 0) {
         ret = READ_ONLY_E;
     }
-#ifdef WOLFPKCS11_LMS_PRIVATE
+#ifdef WOLFPKCS11_STATEFUL_SIG_PRIVATE
     /* Durable mode: fsync the parent directory so the rename itself is
      * persisted (the directory entry, not just the file data). Otherwise a
      * crash could lose the rename and roll the signature state back. */
     if (ret == 0 && ctx->durable) {
         char dirPath[WP11_STORE_MAX_PATH];
-        int  n = (int)XSTRLEN(ctx->final_name);
-        int  slash = -1, i;
 
-        for (i = n - 1; i >= 0; i--) {
-            if (ctx->final_name[i] == '/') {
-                slash = i;
-                break;
-            }
-        }
-        if (slash <= 0) {
-            dirPath[0] = (slash == 0) ? '/' : '.';
-            dirPath[1] = '\0';
-        }
-        else if (slash < (int)sizeof(dirPath)) {
-            XMEMCPY(dirPath, ctx->final_name, slash);
-            dirPath[slash] = '\0';
-        }
-        else {
-            ret = READ_ONLY_E;
-        }
+        ret = wolfPKCS11_StoreDirName(ctx->final_name, dirPath,
+            (int)sizeof(dirPath));
         if (ret == 0) {
             int dirFd = open(dirPath, O_RDONLY);
             if (dirFd >= 0) {
@@ -1746,9 +1229,6 @@ int wolfPKCS11_Store_OpenSz(int type, CK_ULONG id1, CK_ULONG id2, int read,
 
     if (ret == 0) {
         char dirPath[WP11_STORE_MAX_PATH];
-        const char* lastSlash = NULL;
-        size_t nameLen = XSTRLEN(name);
-        size_t i;
 
         XMEMSET(ctx, 0, sizeof(*ctx));
         ctx->file = XBADFILE;
@@ -1771,30 +1251,12 @@ int wolfPKCS11_Store_OpenSz(int type, CK_ULONG id1, CK_ULONG id2, int read,
             }
         }
         else if (ret == 0) {
-            for (i = 0; i < nameLen; i++) {
-                if (name[i] == '/' || name[i] == '\\') {
-                    lastSlash = &name[i];
-                }
+            ret = wolfPKCS11_StoreDirName(name, dirPath, (int)sizeof(dirPath));
+            if (ret == 0) {
+                ret = wolfPKCS11_StoreEnsureDir(dirPath);
             }
-
-            if (lastSlash == NULL) {
-                ret = READ_ONLY_E;
-            }
-            else {
-                int dirLen = (int)(lastSlash - name);
-
-                if (dirLen <= 0 || dirLen >= (int)sizeof(dirPath)) {
-                    ret = READ_ONLY_E;
-                }
-                else {
-                    XMEMCPY(dirPath, name, dirLen);
-                    dirPath[dirLen] = '\0';
-
-                    ret = wolfPKCS11_StoreEnsureDir(dirPath);
-                    if (ret == 0) {
-                        ret = wolfPKCS11_StoreCreateTempFile(ctx, dirPath);
-                    }
-                }
+            if (ret == 0) {
+                ret = wolfPKCS11_StoreCreateTempFile(ctx, dirPath);
             }
         }
     }
@@ -1844,17 +1306,17 @@ int wolfPKCS11_Store_Open(int type, CK_ULONG id1, CK_ULONG id2, int read,
 }
 
 /**
- * Closes access to location being read or written.
- * Any dynamic memory associated with the store is freed here.
+ * Closes access to location being read or written and reports whether the
+ * commit succeeded. Any dynamic memory associated with the store is freed
+ * here. A close that cannot report failure would mask a failed fsync or
+ * rename, which for stateful signature state risks releasing a signature
+ * whose advanced state never reached stable storage.
  *
  * @param [in]  store  Context for operation.
+ * @return  0 on success.
+ * @return  Other value when a durable flush or the temp-file commit failed.
  */
-/* Close the store and report whether the durable commit succeeded. A plain
- * void close would mask a failed fsync/rename, which for stateful signature
- * state would risk releasing a signature whose advanced state was not
- * persisted. Returns 0 on success, non-zero if a durable flush or the
- * temp-file commit failed. */
-static int wolfPKCS11_Store_CloseAndReport(void* store)
+int wolfPKCS11_Store_CloseAndReport(void* store)
 {
 #ifdef WOLFPKCS11_TPM_STORE
     WP11_TpmStore* tpmStore = (WP11_TpmStore*)store;
@@ -1874,12 +1336,13 @@ static int wolfPKCS11_Store_CloseAndReport(void* store)
     if (ctx != NULL) {
         int commitRet = 0;
         int fsyncFailed = 0;
-#if defined(WOLFPKCS11_LMS_PRIVATE) && !defined(_WIN32) && !defined(_MSC_VER)
+#if defined(WOLFPKCS11_STATEFUL_SIG_PRIVATE) && \
+    !defined(_WIN32) && !defined(_MSC_VER)
         int fd;
 #endif
 
         if (ctx->file != XBADFILE && ctx->file != NULL) {
-#ifdef WOLFPKCS11_LMS_PRIVATE
+#ifdef WOLFPKCS11_STATEFUL_SIG_PRIVATE
             /* Durable mode: flush the file data to disk before close so the
              * rename in CommitTemp commits a fully-persisted file. POSIX uses
              * fsync(); Windows/MSVC uses _commit() (FlushFileBuffers under the
@@ -1926,6 +1389,10 @@ static int wolfPKCS11_Store_CloseAndReport(void* store)
     return ret;
 }
 
+/* wolfPKCS11_Store_Close is the store backend interface declared in
+ * wolfpkcs11/store.h and reimplemented by WOLFPKCS11_CUSTOM_STORE builds, so
+ * it keeps its void return; callers that need the commit result use
+ * wolfPKCS11_Store_CloseAndReport above instead. */
 void wolfPKCS11_Store_Close(void* store)
 {
     (void)wolfPKCS11_Store_CloseAndReport(store);
@@ -2038,7 +1505,7 @@ int wolfPKCS11_Store_Write(void* store, unsigned char* buffer, int len)
  * @return  NOT_AVAILABLE_E when data not available.
  * @return  Other value to indicate failure.
  */
-static int wp11_storage_open_readonly(int type, CK_ULONG id1, CK_ULONG id2,
+int wp11_storage_open_readonly(int type, CK_ULONG id1, CK_ULONG id2,
                               void** storage)
 {
     return wolfPKCS11_Store_Open(type, id1, id2, 1, storage);
@@ -2056,7 +1523,7 @@ static int wp11_storage_open_readonly(int type, CK_ULONG id1, CK_ULONG id2,
  * @return  NOT_AVAILABLE_E when data not available.
  * @return  Other value to indicate failure.
  */
-static int wp11_storage_open(int type, CK_ULONG id1, CK_ULONG id2,
+int wp11_storage_open(int type, CK_ULONG id1, CK_ULONG id2,
                              int variableSz, void** storage)
 {
 #ifdef WOLFPKCS11_TPM_STORE
@@ -2078,7 +1545,7 @@ static int wp11_storage_remove(int type, CK_ULONG id1, CK_ULONG id2)
  *
  * @param [in]  store  Context for operation.
  */
-static void wp11_storage_close(void* storage)
+void wp11_storage_close(void* storage)
 {
     wolfPKCS11_Store_Close(storage);
 }
@@ -2092,7 +1559,7 @@ static void wp11_storage_close(void* storage)
  * @return  0 on success.
  * @return  BUFFER_E to indicate failure.
  */
-static int wp11_storage_read(void* storage, unsigned char* buffer, int len)
+int wp11_storage_read(void* storage, unsigned char* buffer, int len)
 {
     int ret = 0;
     unsigned char* p = buffer;
@@ -2127,7 +1594,7 @@ static int wp11_storage_read(void* storage, unsigned char* buffer, int len)
  * @return  0 on success.
  * @return  BUFFER_E to indicate failure.
  */
-static int wp11_storage_write(void* storage, unsigned char* buffer, int len)
+int wp11_storage_write(void* storage, unsigned char* buffer, int len)
 {
     int ret = 0;
     unsigned char* p = buffer;
@@ -2442,7 +1909,7 @@ static int wp11_storage_read_array(void* storage, unsigned char* buffer,
  * @return  0 on success.
  * @return  BUFFER_E to indicate failure.
  */
-static int wp11_storage_write_array(void* storage,
+int wp11_storage_write_array(void* storage,
                                     unsigned char* buffer, word32 len)
 {
     int ret;
@@ -2467,7 +1934,7 @@ static int wp11_storage_write_array(void* storage,
  * @return  BUFFER_E to indicate failure.
  * @return  MEMORY_E when dynamic memory allocation fails.
  */
-static int wp11_storage_read_alloc_array(void* storage,
+int wp11_storage_read_alloc_array(void* storage,
                                          unsigned char** buffer, int* len)
 {
     int ret;
@@ -3317,50 +2784,6 @@ static int wp11_DecryptData(byte* out, byte* data, int len, byte* key,
     return ret;
 }
 
-#ifdef WOLFPKCS11_LMS_PRIVATE
-/* AES-GCM encrypt with caller-supplied AAD. The tag is appended to the
- * ciphertext (out[len .. len+AES_BLOCK_SIZE-1]). Used for HSS state files so
- * the file header (magic, version, parameters, sig count) is bound to the
- * ciphertext via authenticated additional data; any tampering with those
- * bytes is detected at decrypt time. */
-static int wp11_EncryptDataAAD(byte* out, const byte* data, int len,
-    const byte* key, int keySz, const byte* iv, int ivSz,
-    const byte* aad, int aadSz, int devId)
-{
-    Aes aes;
-    int ret;
-
-    ret = wc_AesInit(&aes, NULL, devId);
-    if (ret == 0)
-        ret = wc_AesGcmSetKey(&aes, key, keySz);
-    if (ret == 0) {
-        ret = wc_AesGcmEncrypt(&aes, out, data, len, iv, ivSz, out + len,
-            AES_BLOCK_SIZE, aad, aadSz);
-    }
-    wc_AesFree(&aes);
-
-    return ret;
-}
-
-static int wp11_DecryptDataAAD(byte* out, const byte* data, int len,
-    const byte* key, int keySz, const byte* iv, int ivSz,
-    const byte* aad, int aadSz, int devId)
-{
-    Aes aes;
-    int ret;
-
-    ret = wc_AesInit(&aes, NULL, devId);
-    if (ret == 0)
-        ret = wc_AesGcmSetKey(&aes, key, keySz);
-    if (ret == 0) {
-        ret = wc_AesGcmDecrypt(&aes, out, data, len, iv, ivSz, data + len,
-            AES_BLOCK_SIZE, aad, aadSz);
-    }
-    wc_AesFree(&aes);
-
-    return ret;
-}
-#endif /* WOLFPKCS11_LMS_PRIVATE */
 
 /**
  * "Decode" the certificate.
@@ -4647,10 +4070,8 @@ static int MldsaKeyTryDecode(wc_MlDsaKey* key, byte level, byte* data,
     int ret = 0;
     word32 idx = 0;
 
-    /* Init key with the object's devId (INVALID_DEVID for no-device builds via
-     * wp11_Slot_Init's default) so ML-DSA offloads to a configured
-     * crypto-callback device and falls through to software otherwise. Mirrors
-     * the import/copy paths, which already use the object devId. */
+    /* Use the object devId, as the import and copy paths do, so a configured
+     * crypto-callback device is used when there is one. */
     ret = wc_MlDsaKey_Init(key, NULL, devId);
 
     if (ret == 0) {
@@ -5456,156 +4877,28 @@ static int wp11_Object_Store_MlKemKey(WP11_Object* object, int tokenId,
 #endif /* WOLFPKCS11_MLKEM */
 
 #ifdef WOLFPKCS11_STATEFUL_SIG_PRIVATE
-/* ===========================================================================
- * Stateful hash-based signature framework
- * ===========================================================================
- *
- * Shared infrastructure for stateful hash-based signature schemes. The first
- * concrete user is LMS/HSS (RFC 8554, this file's WOLFPKCS11_LMS_PRIVATE
- * block). Future schemes (XMSS, XMSS^MT — RFC 8391) plug into the same
- * framework via thin wrappers.
- *
- * Contract every stateful-sig scheme MUST honour:
- *
- *   1. Token-resident only. Session-only stateful keys are unsafe (a process
- *      crash between sign and cleanup can release a signature whose OTS
- *      index was never persisted). Reject CKA_TOKEN=FALSE in C_GenerateKeyPair
- *      with CKR_TEMPLATE_INCONSISTENT.
- *
- *   2. State file keyed by a per-key 64-bit nonce, NOT by the object's
- *      position in the token list. The nonce is generated at keygen time
- *      and stored in the shell file's last 8 bytes. WP11_Object holds a
- *      copy in `statefulStateId`. Token-list reordering (Add/Remove,
- *      Slot_Store) must NEVER move or delete the state file.
- *
- *   3. State persistence is synchronous and durable. The wolfSSL write
- *      callback writes the encrypted state file with fsync + atomic rename
- *      + parent-directory fsync (unless WOLFPKCS11_STATEFUL_RELAX_FSYNC=1)
- *      BEFORE returning success — so wolfSSL never releases a signature
- *      whose state advance has not reached stable storage.
- *
- *   4. State file uses AES-GCM (slot-key) with the AAD-bound header below.
- *      Tampering with parameters or the persisted sigCount fails decrypt.
- *
- *   5. SigCount tracked in the wp11 layer (`statefulSigCount`), persisted
- *      inside the AAD-bound header, and used to compute KEYS_REMAINING —
- *      no reads from wolfSSL key internals (priv_raw layout is not public
- *      API and varies between backends).
- *
- *   6. Poison-on-failure. Any state-write failure or sign error clears
- *      WP11_FLAG_STATEFUL_STATE_VALID; subsequent signs return
- *      CKR_DEVICE_ERROR until the object is reloaded from disk
- *      (wolfSSL Reload restores in-memory state from the durable file).
- *
- *   7. Locking: all post-keygen state-mutating paths run under the token
- *      lock (priv->lock points at &token->lock for token-resident keys).
- *      EXCEPTION: during the keygen function itself, priv is thread-local
- *      (no other thread has the handle yet, and priv->lock has not been
- *      assigned by WP11_Session_AddObject), so the write callback fires
- *      unlocked. This is safe only because no concurrent reader can find
- *      priv before keygen returns.
- *
- * On-disk layouts:
- *
- *   Shell file (per scheme; non-secret metadata):
- *     [u32 magic][u32 version][scheme-specific params + pub][u64 stateId]
- *     The trailer (stateId) is always the last 8 bytes — that's how
- *     wp11_Stateful_PeekStateIdFromShell finds it without parsing.
- *
- *   State file (AES-GCM, AAD-bound):
- *     AAD: [u32 magic][u32 version][scheme params (P bytes)][u64 sigCount]
- *     [u32 ivLen][iv (12 bytes)]
- *     [u32 ctLen][ciphertext (privSz + 16-byte GCM tag)]
- */
-
-/* Big-endian byte helpers for encoding/decoding the AAD-bound state header
- * and the shell trailer (compiled in sign builds only - the whole framework
- * is gated by WOLFPKCS11_STATEFUL_SIG_PRIVATE above). */
-static word32 wp11_Stateful_ReadU32(const byte* p)
-{
-    return ((word32)p[0] << 24) | ((word32)p[1] << 16)
-         | ((word32)p[2] << 8)  |  (word32)p[3];
-}
-
-static word64 wp11_Stateful_ReadU64(const byte* p)
-{
-    return ((word64)p[0] << 56) | ((word64)p[1] << 48)
-         | ((word64)p[2] << 40) | ((word64)p[3] << 32)
-         | ((word64)p[4] << 24) | ((word64)p[5] << 16)
-         | ((word64)p[6] << 8)  |  (word64)p[7];
-}
-
-static void wp11_Stateful_WriteU32(byte* p, word32 v)
-{
-    p[0] = (byte)(v >> 24);
-    p[1] = (byte)(v >> 16);
-    p[2] = (byte)(v >> 8);
-    p[3] = (byte)v;
-}
-
-static void wp11_Stateful_WriteU64(byte* p, word64 v)
-{
-    p[0] = (byte)(v >> 56);
-    p[1] = (byte)(v >> 48);
-    p[2] = (byte)(v >> 40);
-    p[3] = (byte)(v >> 32);
-    p[4] = (byte)(v >> 24);
-    p[5] = (byte)(v >> 16);
-    p[6] = (byte)(v >> 8);
-    p[7] = (byte)v;
-}
-
-/* IV length for the AES-GCM-encrypted state file. The full 96-bit GCM
- * standard IV; same for every scheme. */
-#define WP11_STATEFUL_IV_LEN          12
-
-/* Cached env-var read once at first use: when 1, the state-write callback
- * skips fsync() (file and directory). DANGEROUS: documented as non-production
- * only. Default is to always fsync. The variable applies to ALL stateful
- * hash-based signature schemes (LMS/HSS today; XMSS in the future) — there
- * is no per-scheme knob, since the durability requirement is identical. */
-static int wp11_StatefulRelaxFsync = -1;
-
-static int wp11_StatefulShouldFsync(void)
-{
-    if (wp11_StatefulRelaxFsync < 0) {
-#ifndef WOLFPKCS11_NO_ENV
-        const char* v = XGETENV("WOLFPKCS11_STATEFUL_RELAX_FSYNC");
-        wp11_StatefulRelaxFsync = (v != NULL && v[0] == '1' && v[1] == '\0') ? 1 : 0;
-#else
-        wp11_StatefulRelaxFsync = 0;
-#endif
-        if (wp11_StatefulRelaxFsync) {
-            /* Single, prominent stderr line — the README documents this is
-             * non-production. Operators who reach this path must see it. */
-            fprintf(stderr,
-                "wolfPKCS11: WARNING: WOLFPKCS11_STATEFUL_RELAX_FSYNC=1 is "
-                "set. Stateful hash-signature state writes will skip fsync; "
-                "a power loss can roll back the leaf-index advance and cause "
-                "OTS-key REUSE. Do NOT use this setting in production.\n");
-        }
-    }
-    return wp11_StatefulRelaxFsync ? 0 : 1;
-}
 
 /* State files use a 64-bit per-key nonce. The public storage entry points
  * (wolfPKCS11_Store_Open / Store_Remove) take ids as CK_ULONG, which is
- * 32-bit on LLP64 platforms (Windows) — passing the nonce through them
+ * 32-bit on LLP64 platforms (Windows) - passing the nonce through them
  * truncates it and shrinks the collision space from 2^64 to 2^32. The
  * helpers below thread word64 through, formatting the path with %016llx,
  * so the nonce stays 64-bit on every platform.
  *
- * WOLFPKCS11_TPM_STORE is forbidden combined with WOLFPKCS11_LMS_PRIVATE
- * (compile-time #error in wolfpkcs11/internal.h), so this code path is
- * file-backed-storage only. */
+ * A TPM store is forbidden for stateful private keys (compile-time #error in
+ * wolfpkcs11/internal.h), so this code path is file-backed-storage only. */
+
+/* Bytes a state-file name needs on top of the token directory and the scheme
+ * prefix, both of which vary and are measured by the caller:
+ * "/wp11_" (6) + "_priv_state_" (12) + two 16-digit hex ids joined by '_'
+ * (33) + the terminating NUL (1). */
+#define WP11_STATEFUL_STATE_NAME_FIXED_LEN  (6 + 12 + 33 + 1)
+
 static int wp11_Stateful_StateFile_Path(const char* schemeFilePrefix,
     int tokenId, word64 stateId, char* name, int nameLen)
 {
     const char* str = NULL;
     char homePath[256];
-    /* "/wp11_<schemePrefix>_priv_state_%016lx_%016llx". Reserve enough for
-     * the longest scheme prefix we might use ("xmssmtkey" = 9). */
-    enum { WP11_STATEFUL_STATE_SUFFIX_RESERVE = 72 };
 
     if (schemeFilePrefix == NULL || schemeFilePrefix[0] == '\0')
         return -1;
@@ -5642,10 +4935,10 @@ static int wp11_Stateful_StateFile_Path(const char* schemeFilePrefix,
 #endif
     if (str == NULL)
         return -1;
-    if (nameLen <= WP11_STATEFUL_STATE_SUFFIX_RESERVE)
+    if (nameLen <= WP11_STATEFUL_STATE_NAME_FIXED_LEN)
         return -1;
     if (XSTRLEN(str) + XSTRLEN(schemeFilePrefix) >
-            (size_t)(nameLen - WP11_STATEFUL_STATE_SUFFIX_RESERVE - 1)) {
+            (size_t)(nameLen - WP11_STATEFUL_STATE_NAME_FIXED_LEN)) {
         return -1;
     }
     return XSNPRINTF(name, nameLen,
@@ -5656,7 +4949,7 @@ static int wp11_Stateful_StateFile_Path(const char* schemeFilePrefix,
 
 /* Open the state file for read or atomic-rename write. Mirrors
  * wolfPKCS11_Store_OpenSz's file-mode body but uses the word64-safe path. */
-static int wp11_Stateful_StateFile_Open(const char* schemeFilePrefix,
+int wp11_Stateful_StateFile_Open(const char* schemeFilePrefix,
     int tokenId, word64 stateId, int read, void** store)
 {
     int ret;
@@ -5681,9 +4974,8 @@ static int wp11_Stateful_StateFile_Open(const char* schemeFilePrefix,
     }
     if (ret == 0) {
         char dirPath[WP11_STORE_MAX_PATH];
-        const char* lastSlash = NULL;
         size_t nameSz = XSTRLEN(name);
-        size_t i;
+
         XMEMSET(ctx, 0, sizeof(*ctx));
         ctx->file = XBADFILE;
         ctx->is_write = (read == 0);
@@ -5698,26 +4990,11 @@ static int wp11_Stateful_StateFile_Open(const char* schemeFilePrefix,
                 ret = NOT_AVAILABLE_E;
         }
         else if (ret == 0) {
-            for (i = 0; i < nameSz; i++) {
-                if (name[i] == '/' || name[i] == '\\')
-                    lastSlash = &name[i];
-            }
-            if (lastSlash == NULL) {
-                ret = READ_ONLY_E;
-            }
-            else {
-                int dirLen = (int)(lastSlash - name);
-                if (dirLen <= 0 || dirLen >= (int)sizeof(dirPath)) {
-                    ret = READ_ONLY_E;
-                }
-                else {
-                    XMEMCPY(dirPath, name, dirLen);
-                    dirPath[dirLen] = '\0';
-                    ret = wolfPKCS11_StoreEnsureDir(dirPath);
-                    if (ret == 0)
-                        ret = wolfPKCS11_StoreCreateTempFile(ctx, dirPath);
-                }
-            }
+            ret = wolfPKCS11_StoreDirName(name, dirPath, (int)sizeof(dirPath));
+            if (ret == 0)
+                ret = wolfPKCS11_StoreEnsureDir(dirPath);
+            if (ret == 0)
+                ret = wolfPKCS11_StoreCreateTempFile(ctx, dirPath);
         }
     }
     if (ret == 0 && (ctx->file == NULL || ctx->file == XBADFILE))
@@ -5735,7 +5012,7 @@ static int wp11_Stateful_StateFile_Open(const char* schemeFilePrefix,
     return ret;
 }
 
-static int wp11_Stateful_StateFile_Remove(const char* schemeFilePrefix,
+int wp11_Stateful_StateFile_Remove(const char* schemeFilePrefix,
     int tokenId, word64 stateId)
 {
     int ret;
@@ -5751,1717 +5028,8 @@ static int wp11_Stateful_StateFile_Remove(const char* schemeFilePrefix,
         return remove(name);
     return -1;
 }
-
-/* Sanity caps for inputs to the generic state-blob helpers. The wolfSSL
- * state buffer for any practical scheme is well below 1 MiB; the scheme
- * parameter region is small (HSS = 12 bytes, XMSS = 4-12 bytes). Reject
- * absurd inputs up front so the size-arithmetic below cannot overflow. */
-#define WP11_STATEFUL_PRIV_MAX        (1U << 20)   /* 1 MiB */
-#define WP11_STATEFUL_PARAMS_MAX      256U
-
-/* Persist the encrypted state file durably. Caller passes the scheme's
- * (schemeFilePrefix, magic, version) and a packed scheme-params buffer
- * that is bound into the GCM AAD. On a successful return the state file
- * at (slot_id, statefulStateId) is fsync'd and renamed atomically.
- *
- * AAD-bound layout (caught by AES-GCM tag):
- *   [u32 magic][u32 version][u32 schemeParamLen][schemeParamBytes]
- *   [u64 sigCount]
- * Including schemeParamLen in the AAD diagnoses thin-wrapper version skew
- * cleanly (a length mismatch surfaces as a header-mismatch BAD_FUNC_ARG
- * before decrypt rather than as opaque AES-GCM tag failure). */
-static int wp11_Stateful_WriteStateBlob(WP11_Object* o,
-    const char* schemeFilePrefix, word32 magic, word32 version,
-    const byte* schemeParamBytes, word32 schemeParamLen,
-    const byte* priv, word32 privSz)
-{
-    int ret;
-    void* storage = NULL;
-    byte iv[WP11_STATEFUL_IV_LEN];
-    byte* hdr = NULL;
-    word32 hdrLen;
-    byte* ct = NULL;
-    word32 ctLen;
-    int tokenId;
-
-    if (o == NULL || o->slot == NULL || priv == NULL || privSz == 0)
-        return BAD_FUNC_ARG;
-    /* Stateful keys are token-resident only — reject any attempt to
-     * persist state for a session-only object. The HSS write CB enforces
-     * this too, but the framework helper enforces it for all schemes. */
-    if (!o->onToken)
-        return BAD_FUNC_ARG;
-    if (o->statefulStateId == 0)
-        return BAD_FUNC_ARG;
-    if (schemeParamBytes == NULL && schemeParamLen != 0)
-        return BAD_FUNC_ARG;
-    /* Defensive caps: prevent size-arithmetic overflow. */
-    if (privSz > WP11_STATEFUL_PRIV_MAX)
-        return BAD_FUNC_ARG;
-    if (schemeParamLen > WP11_STATEFUL_PARAMS_MAX)
-        return BAD_FUNC_ARG;
-
-    ctLen = privSz + AES_BLOCK_SIZE;  /* +16 for GCM tag */
-    hdrLen = 4 + 4 + 4 + schemeParamLen + 8;
-    hdr = (byte*)XMALLOC(hdrLen, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-    if (hdr == NULL)
-        return MEMORY_E;
-
-    wp11_Stateful_WriteU32(hdr + 0, magic);
-    wp11_Stateful_WriteU32(hdr + 4, version);
-    wp11_Stateful_WriteU32(hdr + 8, schemeParamLen);
-    if (schemeParamLen > 0)
-        XMEMCPY(hdr + 12, schemeParamBytes, schemeParamLen);
-    wp11_Stateful_WriteU64(hdr + 12 + schemeParamLen, o->statefulSigCount);
-
-    /* Fresh GCM nonce per write (NEVER reuse object->iv). */
-    ret = WP11_Slot_GenerateRandom(o->slot, iv, WP11_STATEFUL_IV_LEN);
-    if (ret != 0) {
-        XFREE(hdr, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        return ret;
-    }
-
-    ct = (byte*)XMALLOC(ctLen, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-    if (ct == NULL) {
-        XFREE(hdr, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        return MEMORY_E;
-    }
-
-    ret = wp11_EncryptDataAAD(ct, priv, (int)privSz,
-        o->slot->token.key, (int)sizeof(o->slot->token.key),
-        iv, WP11_STATEFUL_IV_LEN, hdr, (int)hdrLen, o->devId);
-    if (ret != 0) {
-        wc_ForceZero(ct, ctLen);
-        XFREE(ct, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        XFREE(hdr, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        return ret;
-    }
-
-    /* total bytes to write: hdr + ivLen u32 + iv + ctLen u32 + ct||tag —
-     * unused for file storage, but kept for parity with TPM_STORE. */
-    (void)(hdrLen + 4 + WP11_STATEFUL_IV_LEN + 4 + ctLen);
-
-    tokenId = (int)o->slot->id;
-    ret = wp11_Stateful_StateFile_Open(schemeFilePrefix, tokenId,
-        o->statefulStateId, 0, &storage);
-    if (ret == 0) {
-        if (wp11_StatefulShouldFsync())
-            wolfPKCS11_Store_SetDurable(storage, 1);
-        ret = wp11_storage_write(storage, hdr, (int)hdrLen);
-        if (ret == 0) {
-            byte ivLenBuf[4];
-            wp11_Stateful_WriteU32(ivLenBuf, WP11_STATEFUL_IV_LEN);
-            ret = wp11_storage_write(storage, ivLenBuf, 4);
-        }
-        if (ret == 0)
-            ret = wp11_storage_write(storage, iv, WP11_STATEFUL_IV_LEN);
-        if (ret == 0) {
-            byte ctLenBuf[4];
-            wp11_Stateful_WriteU32(ctLenBuf, ctLen);
-            ret = wp11_storage_write(storage, ctLenBuf, 4);
-        }
-        if (ret == 0)
-            ret = wp11_storage_write(storage, ct, (int)ctLen);
-        /* Capture the close-and-commit result. A void close would mask
-         * a failed rename/fsync; that would let wolfSSL release a signature
-         * whose state advance never reached durable storage. */
-        {
-            int closeRet = wolfPKCS11_Store_CloseAndReport(storage);
-            if (ret == 0)
-                ret = closeRet;
-        }
-    }
-
-    wc_ForceZero(ct, ctLen);
-    XFREE(ct, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-    XFREE(hdr, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-    return ret;
-}
-
-/* Read and decrypt the state file. The full header is verified as AAD by
- * the AES-GCM tag; tampering with magic, version, scheme params, scheme-
- * params length, or the persisted sigCount fails decrypt. The expected
- * scheme params are passed by the caller (typically: re-pack from the
- * in-memory wolfSSL key); a mismatch returns BAD_FUNC_ARG before decrypt.
- * The decrypted sigCount is restored into o->statefulSigCount. */
-static int wp11_Stateful_ReadStateBlob(WP11_Object* o,
-    const char* schemeFilePrefix, word32 magic, word32 version,
-    const byte* expectedSchemeParamBytes, word32 schemeParamLen,
-    byte* priv, word32 privSz)
-{
-    int ret;
-    void* storage = NULL;
-    byte* hdr = NULL;
-    word32 hdrLen;
-    byte iv[WP11_STATEFUL_IV_LEN];
-    byte* ct = NULL;
-    word32 m, v, persistedParamLen, ivLen, ctLen;
-    word64 sigCount = 0;
-    int tokenId;
-
-    if (o == NULL || priv == NULL || privSz == 0)
-        return BAD_FUNC_ARG;
-    if (o->statefulStateId == 0)
-        return BAD_FUNC_ARG;
-    if (expectedSchemeParamBytes == NULL && schemeParamLen != 0)
-        return BAD_FUNC_ARG;
-    if (privSz > WP11_STATEFUL_PRIV_MAX)
-        return BAD_FUNC_ARG;
-    if (schemeParamLen > WP11_STATEFUL_PARAMS_MAX)
-        return BAD_FUNC_ARG;
-
-    hdrLen = 4 + 4 + 4 + schemeParamLen + 8;
-    hdr = (byte*)XMALLOC(hdrLen, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-    if (hdr == NULL) {
-        wc_ForceZero(priv, privSz);
-        return MEMORY_E;
-    }
-
-    tokenId = (int)o->slot->id;
-    ret = wp11_Stateful_StateFile_Open(schemeFilePrefix, tokenId,
-        o->statefulStateId, 1, &storage);
-    if (ret != 0) {
-        XFREE(hdr, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        wc_ForceZero(priv, privSz);
-        return ret;
-    }
-
-    ret = wp11_storage_read(storage, hdr, (int)hdrLen);
-    if (ret == 0) {
-        m = wp11_Stateful_ReadU32(hdr);
-        v = wp11_Stateful_ReadU32(hdr + 4);
-        persistedParamLen = wp11_Stateful_ReadU32(hdr + 8);
-        sigCount = wp11_Stateful_ReadU64(hdr + 12 + schemeParamLen);
-        if (m != magic || v != version) {
-            ret = BAD_FUNC_ARG;
-        }
-        else if (persistedParamLen != schemeParamLen) {
-            /* Scheme-params length mismatch — diagnoses thin-wrapper
-             * version skew before AES-GCM tag failure. */
-            ret = BAD_FUNC_ARG;
-        }
-        else if (schemeParamLen > 0 &&
-                 XMEMCMP(hdr + 12, expectedSchemeParamBytes, schemeParamLen)
-                 != 0) {
-            ret = BAD_FUNC_ARG;
-        }
-    }
-    if (ret == 0) {
-        byte buf[4];
-        ret = wp11_storage_read(storage, buf, 4);
-        if (ret == 0) {
-            ivLen = wp11_Stateful_ReadU32(buf);
-            if (ivLen != WP11_STATEFUL_IV_LEN)
-                ret = BAD_FUNC_ARG;
-        }
-    }
-    if (ret == 0)
-        ret = wp11_storage_read(storage, iv, WP11_STATEFUL_IV_LEN);
-    if (ret == 0) {
-        byte buf[4];
-        ret = wp11_storage_read(storage, buf, 4);
-        if (ret == 0) {
-            ctLen = wp11_Stateful_ReadU32(buf);
-            if (ctLen < AES_BLOCK_SIZE ||
-                    ctLen - AES_BLOCK_SIZE != privSz) {
-                ret = BAD_FUNC_ARG;
-            }
-        }
-    }
-    if (ret == 0) {
-        ct = (byte*)XMALLOC(ctLen, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        if (ct == NULL)
-            ret = MEMORY_E;
-    }
-    if (ret == 0)
-        ret = wp11_storage_read(storage, ct, (int)ctLen);
-    if (ret == 0) {
-        ret = wp11_DecryptDataAAD(priv, ct, (int)privSz,
-            o->slot->token.key, (int)sizeof(o->slot->token.key),
-            iv, WP11_STATEFUL_IV_LEN, hdr, (int)hdrLen, o->devId);
-        /* AES-GCM authentication failure manifests here. */
-    }
-    wp11_storage_close(storage);
-    if (ct != NULL) {
-        wc_ForceZero(ct, ctLen);
-        XFREE(ct, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-    }
-    XFREE(hdr, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-    if (ret == 0) {
-        /* AES-GCM verified the header; sigCount cannot have been rolled
-         * back without detection. Restore into the in-memory object. */
-        o->statefulSigCount = sigCount;
-    }
-    if (ret != 0)
-        wc_ForceZero(priv, privSz);
-    return ret;
-}
-
-/* Recover the per-key stateId from the on-disk shell file. The shell
- * format is otherwise scheme-specific, but by contract the LAST 8 bytes
- * are always the u64 stateId. Used by Unstore to find the state file
- * before deleting it, when the in-memory object hasn't been decoded yet.
- *
- * Validates the shell's magic + version against caller-supplied values
- * before returning the trailer. Without this check, a truncated, replaced,
- * or wrong-scheme file at the same (tokenId, objId) would yield a garbage
- * stateId that the caller then passes to Store_Remove — silently no-op'ing
- * or deleting the wrong file while the real state file orphans on disk.
- *
- * Returns BAD_FUNC_ARG if magic or version don't match (e.g., wrong scheme,
- * file truncated below the header size, or the file is something else). */
-static int wp11_Stateful_PeekStateIdFromShell(int tokenId, int objId,
-    int storeTypeShell, word32 expectedShellMagic, word32 expectedShellVersion,
-    word64* outStateId)
-{
-    int ret;
-    void* storage = NULL;
-    unsigned char* buf = NULL;
-    int bufLen = 0;
-
-    if (outStateId == NULL)
-        return BAD_FUNC_ARG;
-    *outStateId = 0;
-
-    ret = wp11_storage_open_readonly(storeTypeShell,
-        (CK_ULONG)tokenId, (CK_ULONG)objId, &storage);
-    if (ret != 0)
-        return ret;
-    ret = wp11_storage_read_alloc_array(storage, &buf, &bufLen);
-    wp11_storage_close(storage);
-    if (ret != 0)
-        return ret;
-
-    /* Need at least [u32 magic][u32 version] + [u64 stateId trailer]. */
-    if (bufLen < 16) {
-        XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        return BAD_FUNC_ARG;
-    }
-    if (wp11_Stateful_ReadU32(buf) != expectedShellMagic ||
-            wp11_Stateful_ReadU32(buf + 4) != expectedShellVersion) {
-        XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        return BAD_FUNC_ARG;
-    }
-    *outStateId = wp11_Stateful_ReadU64(buf + (bufLen - 8));
-    XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-    return 0;
-}
-
 #endif /* WOLFPKCS11_STATEFUL_SIG_PRIVATE */
-#ifdef WOLFPKCS11_LMS
-/* ===========================================================================
- * LMS/HSS (RFC 8554): verification and public-key import.
- *
- * Verify-only: this build imports raw HSS public keys and verifies
- * signatures. There is no private-key/keygen/sign or persisted signature
- * state here. The public key is self-describing, so wolfSSL derives the
- * parameter set from the key bytes on import; the CKA_HSS_LEVELS /
- * CKA_HSS_LMS_TYPE / CKA_HSS_LMOTS_TYPE attributes are optional and, when
- * supplied, are validated against the imported key.
- * ========================================================================= */
 
-/* Map tree height -> RFC 8554 LMS typecode. Returns 0 on unknown height. */
-static CK_LMS_TYPE wp11_HssHeightToLmsType(int h)
-{
-    switch (h) {
-        case 5:  return CKL_LMS_SHA256_M32_H5;
-        case 10: return CKL_LMS_SHA256_M32_H10;
-        case 15: return CKL_LMS_SHA256_M32_H15;
-        case 20: return CKL_LMS_SHA256_M32_H20;
-        case 25: return CKL_LMS_SHA256_M32_H25;
-        default: return 0;
-    }
-}
-
-/* Map Winternitz -> LMOTS typecode. Returns 0 on unknown. */
-static CK_LMOTS_TYPE wp11_HssWToLmotsType(int w)
-{
-    switch (w) {
-        case 1: return CKL_LMOTS_SHA256_N32_W1;
-        case 2: return CKL_LMOTS_SHA256_N32_W2;
-        case 4: return CKL_LMOTS_SHA256_N32_W4;
-        case 8: return CKL_LMOTS_SHA256_N32_W8;
-        default: return 0;
-    }
-}
-
-#ifdef WOLFPKCS11_LMS_PRIVATE
-/* Forward parameter maps (RFC 8554 typecode -> height / Winternitz), used by
- * keygen to translate the CKA_HSS_LMS_TYPE / CKA_HSS_LMOTS_TYPE attributes.
- * Return 0 on unknown. */
-static int wp11_HssLmsTypeToHeight(CK_LMS_TYPE t)
-{
-    switch (t) {
-        case CKL_LMS_SHA256_M32_H5:  return 5;
-        case CKL_LMS_SHA256_M32_H10: return 10;
-        case CKL_LMS_SHA256_M32_H15: return 15;
-        case CKL_LMS_SHA256_M32_H20: return 20;
-        case CKL_LMS_SHA256_M32_H25: return 25;
-        default:                     return 0;
-    }
-}
-
-static int wp11_HssLmotsTypeToW(CK_LMOTS_TYPE t)
-{
-    switch (t) {
-        case CKL_LMOTS_SHA256_N32_W1: return 1;
-        case CKL_LMOTS_SHA256_N32_W2: return 2;
-        case CKL_LMOTS_SHA256_N32_W4: return 4;
-        case CKL_LMOTS_SHA256_N32_W8: return 8;
-        default:                      return 0;
-    }
-}
-
-/* On-disk magic + version for the HSS private-key shell file: non-secret
- * metadata (parameters + cached public key) with the 8-byte stateId nonce as
- * the last 8 bytes. Persisted at keygen so token load can call
- * wc_LmsKey_SetParameters before wc_LmsKey_Reload and locate the state file. */
-#define WP11_HSS_SHELL_MAGIC      0x48535350UL  /* "HSSP" */
-#define WP11_HSS_SHELL_VERSION    1U
-
-/* On-disk magic + version for the encrypted HSS state file. The header
- * (levels/height/winternitz + persisted signature counter) is bound into the
- * AES-GCM tag via AAD, so tampering is detected at decrypt time. */
-#define WP11_HSS_STATE_MAGIC      0x48535353UL  /* "HSSS" */
-#define WP11_HSS_STATE_VERSION    1U
-
-/* HSS scheme param region inside the AAD-bound state header: 3 u32s. */
-#define WP11_HSS_SCHEME_PARAM_LEN 12U
-
-/* Serialize the private-key shell header:
- *   [u32 magic][u32 version][u32 levels][u32 height][u32 winternitz]
- *   [u32 pubLen][pub]. The 8-byte stateId trailer is appended by the caller.
- * Returns bytes written, or BUFFER_E. */
-static int wp11_HssPackShellHeader(byte* out, word32 outLen, int levels,
-    int height, int winternitz, const byte* pub, word32 pubLen)
-{
-    word32 needed = 4 + 4 + 4 + 4 + 4 + 4 + pubLen;
-    word32 idx = 0;
-
-    if (out == NULL || outLen < needed)
-        return BUFFER_E;
-    wp11_Stateful_WriteU32(out + idx, (word32)WP11_HSS_SHELL_MAGIC);   idx += 4;
-    wp11_Stateful_WriteU32(out + idx, (word32)WP11_HSS_SHELL_VERSION); idx += 4;
-    wp11_Stateful_WriteU32(out + idx, (word32)levels);      idx += 4;
-    wp11_Stateful_WriteU32(out + idx, (word32)height);      idx += 4;
-    wp11_Stateful_WriteU32(out + idx, (word32)winternitz);  idx += 4;
-    wp11_Stateful_WriteU32(out + idx, pubLen);              idx += 4;
-    if (pub != NULL && pubLen > 0)
-        XMEMCPY(out + idx, pub, pubLen);
-    idx += pubLen;
-    return (int)idx;
-}
-
-/* Parse the private-key shell header. On success *pub points into the input
- * buffer (no allocation) and *pubLen is its length. */
-static int wp11_HssParseShellHeader(const byte* in, word32 inLen,
-    int* levels, int* height, int* winternitz,
-    const byte** pub, word32* pubLen)
-{
-    word32 idx = 0;
-    word32 magic, version, pl;
-
-    if (in == NULL || inLen < 24)
-        return BAD_FUNC_ARG;
-    magic = wp11_Stateful_ReadU32(in + idx);   idx += 4;
-    version = wp11_Stateful_ReadU32(in + idx); idx += 4;
-    if (magic != WP11_HSS_SHELL_MAGIC || version != WP11_HSS_SHELL_VERSION)
-        return BAD_FUNC_ARG;
-    *levels = (int)wp11_Stateful_ReadU32(in + idx);     idx += 4;
-    *height = (int)wp11_Stateful_ReadU32(in + idx);     idx += 4;
-    *winternitz = (int)wp11_Stateful_ReadU32(in + idx); idx += 4;
-    pl = wp11_Stateful_ReadU32(in + idx);               idx += 4;
-    /* Cap pubLen against the max HSS public-key size so a malformed shell
-     * cannot force a giant ImportPubRaw. */
-    if (pl > HSS_MAX_PUBLIC_KEY_LEN)
-        return BAD_FUNC_ARG;
-    if (idx + pl > inLen)
-        return BAD_FUNC_ARG;
-    *pub = in + idx;
-    *pubLen = pl;
-    return 0;
-}
-
-/* Pack the HSS scheme params (levels|height|winternitz, big-endian u32s) into
- * the AAD-bound region of the state header. */
-static void wp11_Hss_PackSchemeParams(byte out[WP11_HSS_SCHEME_PARAM_LEN],
-    int levels, int height, int winternitz)
-{
-    wp11_Stateful_WriteU32(out + 0, (word32)levels);
-    wp11_Stateful_WriteU32(out + 4, (word32)height);
-    wp11_Stateful_WriteU32(out + 8, (word32)winternitz);
-}
-
-/* HSS state-file write, keyed on disk by (slot_id, statefulStateId). Thin
- * wrapper over the generic durable state-blob writer. */
-static int wp11_Hss_WriteStateBlob(WP11_Object* o, const byte* priv,
-    word32 privSz)
-{
-    int levels = 0, height = 0, winternitz = 0;
-    byte schemeParams[WP11_HSS_SCHEME_PARAM_LEN];
-    int ret;
-
-    if (o == NULL || o->data.lmsKey == NULL)
-        return BAD_FUNC_ARG;
-    ret = wc_LmsKey_GetParameters(o->data.lmsKey, &levels, &height,
-        &winternitz);
-    if (ret != 0)
-        return ret;
-    wp11_Hss_PackSchemeParams(schemeParams, levels, height, winternitz);
-    return wp11_Stateful_WriteStateBlob(o, "hsskey",
-        (word32)WP11_HSS_STATE_MAGIC, WP11_HSS_STATE_VERSION,
-        schemeParams, WP11_HSS_SCHEME_PARAM_LEN, priv, privSz);
-}
-
-/* HSS state-file read. Validates the in-memory key's params against the
- * AAD-bound header before AES-GCM decrypt. */
-static int wp11_Hss_ReadStateBlob(WP11_Object* o, byte* priv, word32 privSz)
-{
-    int levels = 0, height = 0, winternitz = 0;
-    byte schemeParams[WP11_HSS_SCHEME_PARAM_LEN];
-    int ret;
-
-    if (o == NULL || o->data.lmsKey == NULL)
-        return BAD_FUNC_ARG;
-    ret = wc_LmsKey_GetParameters(o->data.lmsKey, &levels, &height,
-        &winternitz);
-    if (ret != 0)
-        return ret;
-    wp11_Hss_PackSchemeParams(schemeParams, levels, height, winternitz);
-    return wp11_Stateful_ReadStateBlob(o, "hsskey",
-        (word32)WP11_HSS_STATE_MAGIC, WP11_HSS_STATE_VERSION,
-        schemeParams, WP11_HSS_SCHEME_PARAM_LEN, priv, privSz);
-}
-
-/* wolfSSL write callback: invoked by wc_LmsKey_MakeKey and wc_LmsKey_Sign
- * after each state advance. Must return WC_LMS_RC_SAVED_TO_NV_MEMORY on
- * success; any other value aborts the sign (wolfSSL zeroizes the signature). */
-static int wp11_Hss_WriteState_Cb(const byte* priv, word32 privSz, void* ctx)
-{
-    WP11_Object* o = (WP11_Object*)ctx;
-
-    if (o == NULL || priv == NULL || privSz == 0)
-        return WC_LMS_RC_BAD_ARG;
-    /* Stateful HSS keys are always token-resident in this build. */
-    if (!o->onToken || o->statefulStateId == 0)
-        return WC_LMS_RC_WRITE_FAIL;
-    if (wp11_Hss_WriteStateBlob(o, priv, privSz) != 0)
-        return WC_LMS_RC_WRITE_FAIL;
-    return WC_LMS_RC_SAVED_TO_NV_MEMORY;
-}
-
-static int wp11_Hss_ReadState_Cb(byte* priv, word32 privSz, void* ctx)
-{
-    WP11_Object* o = (WP11_Object*)ctx;
-
-    if (o == NULL)
-        return WC_LMS_RC_BAD_ARG;
-    if (wp11_Hss_ReadStateBlob(o, priv, privSz) != 0)
-        return WC_LMS_RC_READ_FAIL;
-    return WC_LMS_RC_READ_TO_MEMORY;
-}
-
-/* Recover the statefulStateId from the on-disk HSS shell (last 8 bytes),
- * validating the shell magic+version first. Used by orphan cleanup when the
- * object has not been decoded into memory. */
-static int wp11_Hss_PeekStateIdFromShell(int tokenId, int objId,
-    word64* outStateId)
-{
-    return wp11_Stateful_PeekStateIdFromShell(tokenId, objId,
-        WOLFPKCS11_STORE_HSSKEY_PRIV, (word32)WP11_HSS_SHELL_MAGIC,
-        WP11_HSS_SHELL_VERSION, outStateId);
-}
-#endif /* WOLFPKCS11_LMS_PRIVATE */
-
-/* Import a raw HSS public key into the given wolfSSL LmsKey. wolfSSL derives
- * the parameter set from the key bytes (RFC 8554 self-describing public key),
- * so no parameters need to be set first. On failure the (partially
- * initialized) key is NOT freed here; the caller owns it. */
-static int wp11_HssImportPub(LmsKey* key, int devId, const byte* pub,
-    word32 pubLen)
-{
-    int ret;
-
-    ret = wc_LmsKey_Init(key, NULL, devId);
-    if (ret == 0)
-        ret = wc_LmsKey_ImportPubRaw(key, pub, pubLen);
-    return ret;
-}
-
-/* Validate caller-supplied HSS parameter attributes against the parameters
- * wolfSSL derived from the just-imported public key. Per the PKCS#11 v3.3 HSS
- * profile the public-key parameters are the individual CK_ULONG attributes
- * CKA_HSS_LEVELS, CKA_HSS_LMS_TYPE (top-level tree height encoding) and
- * CKA_HSS_LMOTS_TYPE (Winternitz encoding). Each is optional; a supplied value
- * that does not match the key is rejected with BAD_FUNC_ARG. levelsAttr,
- * lmsAttr and lmotsAttr are the raw attribute buffers (NULL when absent) with
- * lengths levelsLen/lmsLen/lmotsLen. */
-static int wp11_HssCheckParamAttrs(LmsKey* key,
-    const byte* levelsAttr, word32 levelsLen,
-    const byte* lmsAttr, word32 lmsLen,
-    const byte* lmotsAttr, word32 lmotsLen)
-{
-    int ret, levels = 0, height = 0, winternitz = 0;
-    CK_ULONG v;
-
-    ret = wc_LmsKey_GetParameters(key, &levels, &height, &winternitz);
-    if (ret != 0)
-        return ret;
-    if (levelsAttr != NULL) {
-        if (levelsLen != sizeof(v))
-            return BAD_FUNC_ARG;
-        XMEMCPY(&v, levelsAttr, sizeof(v));
-        if (v != (CK_ULONG)levels)
-            return BAD_FUNC_ARG;
-    }
-    if (lmsAttr != NULL) {
-        if (lmsLen != sizeof(v))
-            return BAD_FUNC_ARG;
-        XMEMCPY(&v, lmsAttr, sizeof(v));
-        if (v != (CK_ULONG)wp11_HssHeightToLmsType(height))
-            return BAD_FUNC_ARG;
-    }
-    if (lmotsAttr != NULL) {
-        if (lmotsLen != sizeof(v))
-            return BAD_FUNC_ARG;
-        XMEMCPY(&v, lmotsAttr, sizeof(v));
-        if (v != (CK_ULONG)wp11_HssWToLmotsType(winternitz))
-            return BAD_FUNC_ARG;
-    }
-    return 0;
-}
-
-/* Serialize the public key: keyData holds the raw RFC 8554 HSS public key. */
-static int wp11_Object_Encode_HssKey(WP11_Object* object)
-{
-    int ret;
-    word32 pubLen = 0;
-
-    if (object->objClass == CKO_PUBLIC_KEY) {
-        /* Public key: raw RFC 8554 public key, unencrypted (Step-1 format). */
-        ret = wc_LmsKey_GetPubLen(object->data.lmsKey, &pubLen);
-        if (ret == 0) {
-            XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-            object->keyData = (unsigned char*)XMALLOC(pubLen, NULL,
-                DYNAMIC_TYPE_TMP_BUFFER);
-            if (object->keyData == NULL)
-                ret = MEMORY_E;
-        }
-        if (ret == 0) {
-            ret = wc_LmsKey_ExportPubRaw(object->data.lmsKey, object->keyData,
-                &pubLen);
-            if (ret == 0)
-                object->keyDataLen = (int)pubLen;
-        }
-        /* On failure release the buffer so a later store does not skip
-         * re-encoding and persist an uninitialised buffer. Public key material
-         * only, so no zeroization needed. */
-        if (ret != 0) {
-            XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-            object->keyData = NULL;
-            object->keyDataLen = 0;
-        }
-        return ret;
-    }
-#ifdef WOLFPKCS11_LMS_PRIVATE
-    if (object->objClass == CKO_PRIVATE_KEY) {
-        /* Private key: a non-secret metadata shell (params + cached public
-         * key + 8-byte stateId trailer). The secret one-time-signature state
-         * is NEVER written to keyData — it lives only in the AES-GCM state
-         * file written by the wolfSSL write callback.
-         *
-         * The shell is immutable after keygen. Once materialized (built at
-         * keygen, or loaded from disk), reuse it: a reloaded signing key
-         * cannot re-export its public root (wolfSSL keeps a key in either
-         * signing or verify state), so rebuilding here would fail. */
-        int levels = 0, height = 0, winternitz = 0;
-        byte pub[HSS_MAX_PUBLIC_KEY_LEN];
-        int hdrLen;
-        word32 needed;
-
-        if (object->keyData != NULL && object->keyDataLen > 0)
-            return 0;
-
-        pubLen = sizeof(pub);
-        ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels, &height,
-            &winternitz);
-        if (ret == 0)
-            ret = wc_LmsKey_ExportPubRaw(object->data.lmsKey, pub, &pubLen);
-        if (ret == 0 && object->statefulStateId == 0)
-            ret = BAD_FUNC_ARG;
-        if (ret == 0) {
-            needed = 24 + pubLen + 8;
-            XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-            object->keyData = (unsigned char*)XMALLOC(needed, NULL,
-                DYNAMIC_TYPE_TMP_BUFFER);
-            if (object->keyData == NULL)
-                ret = MEMORY_E;
-        }
-        if (ret == 0) {
-            hdrLen = wp11_HssPackShellHeader(object->keyData, needed, levels,
-                height, winternitz, pub, pubLen);
-            if (hdrLen < 0) {
-                ret = hdrLen;
-            }
-            else {
-                wp11_Stateful_WriteU64(object->keyData + hdrLen,
-                    object->statefulStateId);
-                object->keyDataLen = hdrLen + 8;
-            }
-        }
-        wc_ForceZero(pub, sizeof(pub));
-        if (ret != 0) {
-            XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-            object->keyData = NULL;
-            object->keyDataLen = 0;
-        }
-        return ret;
-    }
-#endif
-    return NOT_AVAILABLE_E;
-}
-
-/* Reconstruct the live wolfSSL key from keyData. Public keys import the raw
- * key directly; private keys parse the shell, reload the durable signature
- * state (via the read callback), and mark the state valid. */
-static int wp11_Object_Decode_HssKey(WP11_Object* object)
-{
-    int ret;
-
-    if (object->objClass == CKO_PUBLIC_KEY) {
-        /* Raw RFC 8554 public key; wolfSSL re-derives the parameter set. */
-        ret = wp11_HssImportPub(object->data.lmsKey, object->devId,
-            object->keyData, (word32)object->keyDataLen);
-        object->encoded = (ret != 0) ? 1 : 0;
-        return ret;
-    }
-#ifdef WOLFPKCS11_LMS_PRIVATE
-    if (object->objClass == CKO_PRIVATE_KEY) {
-        int levels = 0, height = 0, winternitz = 0;
-        const byte* pub = NULL;
-        word32 pubLen = 0;
-        word32 idx = 0;
-
-        ret = wp11_HssParseShellHeader(object->keyData,
-            (word32)object->keyDataLen, &levels, &height, &winternitz,
-            &pub, &pubLen);
-        if (ret == 0) {
-            idx = 24 + pubLen;   /* 8-byte stateId trailer follows the pub */
-            if (idx + 8 > (word32)object->keyDataLen)
-                ret = BAD_FUNC_ARG;
-        }
-        if (ret == 0) {
-            object->statefulStateId =
-                wp11_Stateful_ReadU64(object->keyData + idx);
-            if (object->statefulStateId == 0)
-                ret = BAD_FUNC_ARG;
-        }
-        /* INVALID_DEVID unconditionally (not object->devId): HSS stateful
-         * signing is software-only by design - HSM/device-backed LMS is out of
-         * scope. This must hold even when the slot has a real devId (a hardware-
-         * offload build), so it is pinned here rather than inheriting the slot
-         * default. A real devId would route to the crypto callback and make
-         * wc_LmsKey_Reload treat the key as HSM-backed and skip the read
-         * callback (a no-op), leaving the reloaded key with no private state -
-         * any later Sign would then reuse leaf index 0 or crash. */
-        if (ret == 0)
-            ret = wc_LmsKey_Init(object->data.lmsKey, NULL, INVALID_DEVID);
-        if (ret == 0)
-            ret = wc_LmsKey_SetParameters(object->data.lmsKey, levels, height,
-                winternitz);
-        /* Wire callbacks before Reload: Reload reads the encrypted state via
-         * the read callback; the write callback is needed for later signing. */
-        if (ret == 0)
-            ret = wc_LmsKey_SetWriteCb(object->data.lmsKey,
-                wp11_Hss_WriteState_Cb);
-        if (ret == 0)
-            ret = wc_LmsKey_SetReadCb(object->data.lmsKey,
-                wp11_Hss_ReadState_Cb);
-        if (ret == 0)
-            ret = wc_LmsKey_SetContext(object->data.lmsKey, object);
-        if (ret == 0)
-            ret = wc_LmsKey_Reload(object->data.lmsKey);
-        /* Do NOT ImportPubRaw here: wolfSSL keeps an LmsKey in either signing
-         * (reloaded) or verify (pub) state, not both, and rejects a pub import
-         * after Reload with BAD_STATE_E. The public root is not needed for
-         * signing, and the cached shell (kept in keyData) preserves it for
-         * re-storage. */
-        (void)pub;
-        if (ret == 0) {
-            object->opFlag |= WP11_FLAG_STATEFUL_STATE_VALID;
-            object->encoded = 0;
-        }
-        else {
-            /* Clear the validity flag so a later Sign cannot use a half-built
-             * key, and free the wolfSSL key. encoded=1 stops Object_Free from
-             * freeing the wolfSSL key a second time. */
-            object->opFlag &= ~WP11_FLAG_STATEFUL_STATE_VALID;
-            wc_LmsKey_Free(object->data.lmsKey);
-            object->encoded = 1;
-        }
-        return ret;
-    }
-#endif
-    return NOT_AVAILABLE_E;
-}
-
-static int wp11_Object_Load_HssKey(WP11_Object* object, int tokenId, int objId)
-{
-    int ret;
-    void* storage = NULL;
-    int storeType = WOLFPKCS11_STORE_HSSKEY_PUB;
-
-#ifdef WOLFPKCS11_LMS_PRIVATE
-    if (object->objClass == CKO_PRIVATE_KEY)
-        storeType = WOLFPKCS11_STORE_HSSKEY_PRIV;
-#endif
-    ret = wp11_storage_open_readonly(storeType, tokenId, objId, &storage);
-    if (ret == 0) {
-        ret = wp11_storage_read_alloc_array(storage, &object->keyData,
-            &object->keyDataLen);
-        wp11_storage_close(storage);
-    }
-    return ret;
-}
-
-static int wp11_Object_Store_HssKey(WP11_Object* object, int tokenId, int objId)
-{
-    int ret = 0;
-    void* storage = NULL;
-    int storeType = WOLFPKCS11_STORE_HSSKEY_PUB;
-
-#ifdef WOLFPKCS11_LMS_PRIVATE
-    if (object->objClass == CKO_PRIVATE_KEY)
-        storeType = WOLFPKCS11_STORE_HSSKEY_PRIV;
-#endif
-    if (object->keyData == NULL)
-        ret = wp11_Object_Encode_HssKey(object);
-    if (ret == 0)
-        ret = wp11_storage_open(storeType, tokenId, objId,
-            object->keyDataLen, &storage);
-    if (ret == 0) {
-        ret = wp11_storage_write_array(storage, object->keyData,
-            object->keyDataLen);
-        wp11_storage_close(storage);
-    }
-    return ret;
-}
-
-/* Import an HSS public key from a C_CreateObject template. Following the
- * PKCS#11 v3.3 HSS profile the collected attributes are data[0]=CKA_HSS_LEVELS,
- * data[1]=CKA_HSS_LMS_TYPE, data[2]=CKA_HSS_LMOTS_TYPE (all optional CK_ULONG)
- * and data[3]=CKA_VALUE, the raw RFC 8554 public key. wolfSSL derives the
- * parameter set from the key bytes; any supplied CKA_HSS_* attribute is
- * validated against the derived parameters and a mismatch is rejected.
- * Private-key import is rejected: caller-supplied stateful private material is
- * a forgery vector and out of scope for verify-only support. */
-int WP11_Object_SetHssKey(WP11_Object* object, unsigned char** data,
-                          CK_ULONG* len)
-{
-    int ret = 0;
-    LmsKey* newKey = NULL;
-
-    if (object == NULL || data == NULL || len == NULL)
-        return BAD_FUNC_ARG;
-#ifdef WOLFPKCS11_LMS_PRIVATE
-    /* Keygen (C_GenerateKeyPair) creates both objects with no CKA_VALUE and
-     * populates them in WP11_Hss_GenerateKeyPair, so a missing value is a
-     * deferred keygen object, not an error. A private key must never be
-     * imported WITH a value: caller-supplied one-time-signature state is a
-     * forgery vector. */
-    if (object->objClass == CKO_PRIVATE_KEY) {
-        if (data[3] != NULL)
-            return BAD_FUNC_ARG;
-        return 0;
-    }
-    if (object->objClass != CKO_PUBLIC_KEY)
-        return BAD_FUNC_ARG;
-    if (data[3] == NULL)
-        return 0;
-#else
-    if (object->objClass != CKO_PUBLIC_KEY)
-        return BAD_FUNC_ARG;
-    /* A public key must carry its value. There is no keygen path in a
-     * verify-only build that would populate it later, so an absent
-     * CKA_VALUE is an incomplete template rather than a deferred import;
-     * reject it instead of creating an unusable object. */
-    if (data[3] == NULL)
-        return BAD_FUNC_ARG;
-#endif
-
-    if (object->onToken)
-        WP11_Lock_LockRW(object->lock);
-
-    /* Import into a temporary key and swap it in only after it fully validates,
-     * so a failed re-import (C_SetAttributeValue with a new CKA_VALUE) leaves
-     * the existing key unchanged as PKCS#11 requires. */
-    newKey = (LmsKey*)XMALLOC(sizeof(LmsKey), NULL, DYNAMIC_TYPE_KEY);
-    if (newKey == NULL)
-        ret = MEMORY_E;
-    if (ret == 0) {
-        XMEMSET(newKey, 0, sizeof(LmsKey));
-        ret = wp11_HssImportPub(newKey, object->devId, data[3],
-            (word32)len[3]);
-    }
-    if (ret == 0) {
-        ret = wp11_HssCheckParamAttrs(newKey, data[0], (word32)len[0],
-            data[1], (word32)len[1], data[2], (word32)len[2]);
-    }
-    if (ret == 0) {
-        /* Replace the live key and drop the cached serialization so a later
-         * store re-encodes from the new key instead of persisting stale bytes. */
-        if (object->data.lmsKey != NULL) {
-            if (!object->encoded)
-                wc_LmsKey_Free(object->data.lmsKey);
-            XFREE(object->data.lmsKey, NULL, DYNAMIC_TYPE_KEY);
-        }
-        object->data.lmsKey = newKey;
-        object->encoded = 0;
-        newKey = NULL;
-        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        object->keyData = NULL;
-        object->keyDataLen = 0;
-    }
-    if (newKey != NULL) {
-        wc_LmsKey_Free(newKey);
-        XFREE(newKey, NULL, DYNAMIC_TYPE_KEY);
-    }
-
-    if (object->onToken)
-        WP11_Lock_UnlockRW(object->lock);
-    return ret;
-}
-
-/* Verify an HSS signature over a raw message. Stateless on the verifier. */
-int WP11_Hss_Verify(unsigned char* sig, word32 sigLen, unsigned char* data,
-                    word32 dataLen, int* stat, WP11_Object* pub)
-{
-    int ret;
-    word32 expSigLen = 0;
-
-    if (pub == NULL || pub->data.lmsKey == NULL || stat == NULL)
-        return BAD_FUNC_ARG;
-
-    /* Verification only reads the key: wc_LmsKey_Verify works from a locally
-     * allocated LmsState, so a shared RO lock is safe for concurrent verifies
-     * on the same token object. */
-    if (pub->onToken)
-        WP11_Lock_LockRO(pub->lock);
-
-    /* A signature whose length does not match the key's parameter set cannot
-     * be valid; report it as an invalid signature (stat = 0 ->
-     * CKR_SIGNATURE_INVALID) rather than letting wolfSSL's length check
-     * surface as a function failure. */
-    if (wc_LmsKey_GetSigLen(pub->data.lmsKey, &expSigLen) == 0 &&
-            sigLen != expSigLen) {
-        *stat = 0;
-        ret = 0;
-    }
-    else {
-        /* Unlike XMSS, whose wolfSSL verify rejects a zero-length message with
-         * BAD_FUNC_ARG, wc_LmsKey_Verify accepts an empty message, so HSS needs
-         * no dataLen == 0 special-case here (see WP11_Xmss_Verify). */
-        ret = wc_LmsKey_Verify(pub->data.lmsKey, sig, sigLen, data,
-            (int)dataLen);
-        /* Only a genuine verification mismatch (SIG_VERIFY_E) maps to stat=0.
-         * Remaining argument/state errors surface as a function failure so
-         * they are not silently reported as an invalid signature. */
-        if (ret == 0) {
-            *stat = 1;
-        }
-        else if (ret == SIG_VERIFY_E) {
-            *stat = 0;
-            ret = 0;
-        }
-        else {
-            *stat = 0;
-        }
-    }
-
-    if (pub->onToken)
-        WP11_Lock_UnlockRO(pub->lock);
-
-    return ret;
-}
-
-#ifdef WOLFPKCS11_LMS_PRIVATE
-/* Generate an HSS key pair. levels/lmsType/lmotsType come from the v3.3
- * keygen template attributes; wolfSSL requires uniform parameters across
- * levels. The private key's one-time-signature state is durably persisted at
- * genesis (via the write callback invoked inside wc_LmsKey_MakeKey) before
- * this returns success. */
-int WP11_Hss_GenerateKeyPair(WP11_Object* pub, WP11_Object* priv,
-                             CK_ULONG levels, CK_LMS_TYPE lmsType,
-                             CK_LMOTS_TYPE lmotsType, WP11_Slot* slot)
-{
-    int ret;
-    int nLevels, height, winternitz;
-    WC_RNG rng;
-    byte pubBuf[HSS_MAX_PUBLIC_KEY_LEN];
-    word32 pubLen = sizeof(pubBuf);
-    int stateWritten = 0;
-
-    if (pub == NULL || priv == NULL || slot == NULL ||
-            pub->data.lmsKey == NULL || priv->data.lmsKey == NULL) {
-        return BAD_FUNC_ARG;
-    }
-
-    /* Translate the v3.3 typecodes to wolfSSL (levels, height, winternitz),
-     * enforcing the wolfSSL level limit. */
-    nLevels = (int)levels;
-    height = wp11_HssLmsTypeToHeight(lmsType);
-    winternitz = wp11_HssLmotsTypeToW(lmotsType);
-    if (nLevels < 1 || nLevels > LMS_MAX_LEVELS || height == 0 ||
-            winternitz == 0) {
-        return BAD_FUNC_ARG;
-    }
-
-    /* Generate the per-key 64-bit nonce keying the state file. Must be
-     * non-zero (0 is the "none" sentinel); retry on the vanishing chance of
-     * zero, else treat as an RNG failure. */
-    {
-        byte nonceBuf[8];
-        int tries;
-        for (tries = 0; tries < 4; tries++) {
-            ret = WP11_Slot_GenerateRandom(slot, nonceBuf, sizeof(nonceBuf));
-            if (ret != 0)
-                return ret;
-            priv->statefulStateId = wp11_Stateful_ReadU64(nonceBuf);
-            if (priv->statefulStateId != 0)
-                break;
-        }
-        if (priv->statefulStateId == 0)
-            return RNG_FAILURE_E;
-    }
-
-    /* Mark on-token so the write CB commits; AddObject formalizes the
-     * registration shortly. priv->lock is assigned later by Session_AddObject;
-     * during keygen no other thread holds a handle, so the CB fires unlocked. */
-    priv->onToken = 1;
-    priv->statefulSigCount = 0;
-
-    /* INVALID_DEVID unconditionally (not priv->devId): HSS stateful signing is
-     * software-only by design - HSM/device-backed LMS is out of scope - so this
-     * is pinned even when the slot has a real devId (a hardware-offload build),
-     * mirroring the reload path in wp11_Object_Decode_HssKey. A real devId would
-     * route MakeKey/Sign through the crypto callback and, critically, make a
-     * later wc_LmsKey_Reload a no-op, so the persisted state could never be
-     * restored. */
-    ret = wc_LmsKey_Init(priv->data.lmsKey, NULL, INVALID_DEVID);
-    if (ret == 0)
-        ret = wc_LmsKey_SetParameters(priv->data.lmsKey, nLevels, height,
-            winternitz);
-    /* Wire callbacks BEFORE MakeKey so genesis state is persisted durably. */
-    if (ret == 0)
-        ret = wc_LmsKey_SetWriteCb(priv->data.lmsKey, wp11_Hss_WriteState_Cb);
-    if (ret == 0)
-        ret = wc_LmsKey_SetReadCb(priv->data.lmsKey, wp11_Hss_ReadState_Cb);
-    if (ret == 0)
-        ret = wc_LmsKey_SetContext(priv->data.lmsKey, priv);
-
-    if (ret == 0)
-        ret = Rng_New(&slot->token.rng, &slot->token.rngLock, &rng);
-    if (ret == 0) {
-        /* MakeKey invokes the write CB to persist genesis state; on success
-         * the genesis state file is durable on disk. */
-        ret = wc_LmsKey_MakeKey(priv->data.lmsKey, &rng);
-        Rng_Free(&rng);
-        if (ret == 0)
-            stateWritten = 1;
-    }
-
-    /* Mirror parameters + public key into the public-key object. */
-    if (ret == 0)
-        ret = wc_LmsKey_ExportPubRaw(priv->data.lmsKey, pubBuf, &pubLen);
-    if (ret == 0)
-        ret = wc_LmsKey_Init(pub->data.lmsKey, NULL, pub->devId);
-    if (ret == 0)
-        ret = wc_LmsKey_SetParameters(pub->data.lmsKey, nLevels, height,
-            winternitz);
-    if (ret == 0)
-        ret = wc_LmsKey_ImportPubRaw(pub->data.lmsKey, pubBuf, pubLen);
-
-    if (ret == 0) {
-        priv->local = pub->local = 1;
-        priv->keyGenMech = pub->keyGenMech = CKM_HSS_KEY_PAIR_GEN;
-        priv->opFlag |= WP11_FLAG_STATEFUL_STATE_VALID;
-    }
-    else {
-        wc_LmsKey_Free(priv->data.lmsKey);
-        /* Mark encoded so the C_GenerateKeyPair cleanup (WP11_Object_Free) does
-         * not free the wolfSSL key a second time; mirrors the failure path in
-         * wp11_Object_Decode_HssKey. */
-        priv->encoded = 1;
-        if (stateWritten && priv->statefulStateId != 0) {
-            (void)wp11_Stateful_StateFile_Remove("hsskey", (int)slot->id,
-                priv->statefulStateId);
-        }
-        priv->statefulStateId = 0;
-    }
-
-    wc_ForceZero(pubBuf, sizeof(pubBuf));
-    return ret;
-}
-
-/* Remove the durable signature-state file backing an HSS private key that was
- * generated but never committed to the token - e.g. a later C_GenerateKeyPair
- * step (AddObject/SetInitialStates/store) failed after keygen already wrote the
- * genesis state to disk. Without this the encrypted state file is orphaned.
- * No-op unless priv is a CKK_HSS private key with a live state id; safe to call
- * on any object and more than once. */
-void WP11_Hss_RemoveOrphanState(WP11_Object* priv, WP11_Slot* slot)
-{
-    if (priv != NULL && slot != NULL && priv->type == CKK_HSS &&
-            priv->objClass == CKO_PRIVATE_KEY && priv->statefulStateId != 0) {
-        (void)wp11_Stateful_StateFile_Remove("hsskey", (int)slot->id,
-            priv->statefulStateId);
-        priv->statefulStateId = 0;
-    }
-}
-
-/* Sign a raw message with an HSS private key. State is advanced and persisted
- * (via the write CB inside wc_LmsKey_Sign) BEFORE the signature is returned.
- * On any failure the in-memory state is poisoned (STATE_VALID cleared) to
- * force a reload from durable storage before the next attempt. Token-resident
- * keys always have priv->lock == &token->lock. */
-int WP11_Hss_Sign(unsigned char* data, word32 dataLen, unsigned char* sig,
-                  word32* sigLen, WP11_Object* priv)
-{
-    int ret = 0;
-    word32 outLen = 0;
-
-    if (priv == NULL || priv->data.lmsKey == NULL || sig == NULL ||
-            sigLen == NULL || priv->lock == NULL) {
-        return BAD_FUNC_ARG;
-    }
-
-    WP11_Lock_LockRW(priv->lock);
-
-    if ((priv->opFlag & WP11_FLAG_STATEFUL_STATE_VALID) == 0) {
-        ret = NOT_AVAILABLE_E;  /* C-layer maps to CKR_DEVICE_ERROR */
-    }
-    if (ret == 0) {
-        word64 prevCount = priv->statefulSigCount;
-        priv->statefulSigCount = prevCount + 1;
-        outLen = *sigLen;
-        ret = wc_LmsKey_Sign(priv->data.lmsKey, sig, &outLen, data,
-            (int)dataLen);
-        if (ret == 0) {
-            *sigLen = outLen;
-        }
-        else {
-            /* Write CB failed (durable state may lag the in-memory advance)
-             * or the key is exhausted. Poison until reloaded; zero any bytes
-             * wolfSSL wrote and revert the in-memory counter. */
-            priv->opFlag &= ~WP11_FLAG_STATEFUL_STATE_VALID;
-            if (outLen > 0)
-                XMEMSET(sig, 0, outLen);
-            priv->statefulSigCount = prevCount;
-        }
-    }
-
-    WP11_Lock_UnlockRW(priv->lock);
-    return ret;
-}
-
-/* Signature length for an HSS private key (parameter-set dependent). Returns
- * 0 on error. */
-word32 WP11_Hss_SigLen(WP11_Object* key)
-{
-    word32 sigLen = 0;
-
-    if (key == NULL || key->data.lmsKey == NULL)
-        return 0;
-    if (wc_LmsKey_GetSigLen(key->data.lmsKey, &sigLen) != 0)
-        return 0;
-    return sigLen;
-}
-
-/* Remaining one-time keys for an HSS private key. Uses the wp11-layer
- * statefulSigCount (persisted in the GCM-authenticated state header) rather
- * than reaching into wolfSSL LmsKey internals. total = 2^(levels*height);
- * saturates at UINT32_MAX for large parameter sets. */
-int WP11_Hss_SigsLeft(WP11_Object* key, word32* remaining)
-{
-    int levels = 0, height = 0, winternitz = 0;
-    int totalH;
-    word64 used, total;
-
-    if (key == NULL || key->data.lmsKey == NULL || remaining == NULL)
-        return BAD_FUNC_ARG;
-
-    if (wc_LmsKey_SigsLeft(key->data.lmsKey) == 0) {
-        *remaining = 0;
-        return 0;
-    }
-    if (wc_LmsKey_GetParameters(key->data.lmsKey, &levels, &height,
-            &winternitz) != 0) {
-        *remaining = 0;
-        return BAD_FUNC_ARG;
-    }
-    totalH = levels * height;
-    if (totalH <= 0) {
-        *remaining = 0;
-        return BAD_FUNC_ARG;
-    }
-    if (totalH >= 64) {
-        *remaining = 0xFFFFFFFFU;
-        return 0;
-    }
-    total = ((word64)1) << totalH;
-    used = key->statefulSigCount;
-    if (used >= total)
-        *remaining = 0;
-    else if ((total - used) > 0xFFFFFFFFULL)
-        *remaining = 0xFFFFFFFFU;
-    else
-        *remaining = (word32)(total - used);
-    return 0;
-}
-#endif /* WOLFPKCS11_LMS_PRIVATE */
-
-/* Serve HSS-specific attributes from a public-key object. */
-static int HssObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
-                             byte* data, CK_ULONG* len)
-{
-    int ret = 0;
-    int levels = 0, height = 0, winternitz = 0;
-
-    if (object == NULL || object->data.lmsKey == NULL || len == NULL)
-        return BAD_FUNC_ARG;
-
-    switch (type) {
-        case CKA_HSS_LEVELS: {
-            CK_ULONG v;
-            ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels,
-                &height, &winternitz);
-            if (ret == 0) {
-                v = (CK_ULONG)levels;
-                if (data == NULL)
-                    *len = sizeof(v);
-                else if (*len < sizeof(v)) {
-                    *len = sizeof(v);
-                    ret = BUFFER_E;
-                }
-                else {
-                    XMEMCPY(data, &v, sizeof(v));
-                    *len = sizeof(v);
-                }
-            }
-            break;
-        }
-        case CKA_HSS_LMS_TYPE: {
-            CK_LMS_TYPE v;
-            ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels,
-                &height, &winternitz);
-            if (ret == 0) {
-                v = wp11_HssHeightToLmsType(height);
-                if (v == 0)
-                    ret = NOT_AVAILABLE_E;
-                else if (data == NULL)
-                    *len = sizeof(v);
-                else if (*len < sizeof(v)) {
-                    *len = sizeof(v);
-                    ret = BUFFER_E;
-                }
-                else {
-                    XMEMCPY(data, &v, sizeof(v));
-                    *len = sizeof(v);
-                }
-            }
-            break;
-        }
-        case CKA_HSS_LMOTS_TYPE: {
-            CK_LMOTS_TYPE v;
-            ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels,
-                &height, &winternitz);
-            if (ret == 0) {
-                v = wp11_HssWToLmotsType(winternitz);
-                if (v == 0)
-                    ret = NOT_AVAILABLE_E;
-                else if (data == NULL)
-                    *len = sizeof(v);
-                else if (*len < sizeof(v)) {
-                    *len = sizeof(v);
-                    ret = BUFFER_E;
-                }
-                else {
-                    XMEMCPY(data, &v, sizeof(v));
-                    *len = sizeof(v);
-                }
-            }
-            break;
-        }
-        case CKA_HSS_LMS_TYPES:
-        case CKA_HSS_LMOTS_TYPES: {
-            /* wolfSSL uses uniform LMS/LMOTS parameters across all HSS levels, so
-             * every array entry is the top-level type. Per-level types (allowed
-             * by the PKCS#11 v3.3 profile) are not expressible by wolfSSL and are
-             * not supported here. */
-            CK_ULONG total;
-            CK_ULONG fill;
-            int i;
-            ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels,
-                &height, &winternitz);
-            if (ret == 0) {
-                total = (CK_ULONG)(sizeof(CK_ULONG) * levels);
-                fill = (type == CKA_HSS_LMS_TYPES)
-                    ? wp11_HssHeightToLmsType(height)
-                    : wp11_HssWToLmotsType(winternitz);
-                if (fill == 0)
-                    ret = NOT_AVAILABLE_E;
-                else if (data == NULL)
-                    *len = total;
-                else if (*len < total) {
-                    *len = total;
-                    ret = BUFFER_E;
-                }
-                else {
-                    for (i = 0; i < levels; i++)
-                        XMEMCPY(data + i * sizeof(CK_ULONG), &fill,
-                            sizeof(CK_ULONG));
-                    *len = total;
-                }
-            }
-            break;
-        }
-        case CKA_HSS_KEYS_REMAINING: {
-            /* Remaining-signature count is a private-key/state property. In a
-             * verify-only build (or for a public key) it is unavailable. */
-#ifdef WOLFPKCS11_LMS_PRIVATE
-            if (object->objClass == CKO_PRIVATE_KEY) {
-                word32 remaining = 0;
-                CK_ULONG v;
-                if (WP11_Hss_SigsLeft(object, &remaining) != 0) {
-                    ret = NOT_AVAILABLE_E;
-                    break;
-                }
-                v = (CK_ULONG)remaining;
-                if (data == NULL)
-                    *len = sizeof(v);
-                else if (*len < sizeof(v)) {
-                    *len = sizeof(v);
-                    ret = BUFFER_E;
-                }
-                else {
-                    XMEMCPY(data, &v, sizeof(v));
-                    *len = sizeof(v);
-                }
-                break;
-            }
-#endif
-            ret = NOT_AVAILABLE_E;
-            break;
-        }
-        case CKA_VALUE:
-            if (object->objClass == CKO_PUBLIC_KEY) {
-                word32 pubLen = 0;
-                ret = wc_LmsKey_GetPubLen(object->data.lmsKey, &pubLen);
-                if (ret == 0) {
-                    if (data == NULL)
-                        *len = pubLen;
-                    else if (*len < pubLen) {
-                        *len = pubLen;
-                        ret = BUFFER_E;
-                    }
-                    else {
-                        ret = wc_LmsKey_ExportPubRaw(object->data.lmsKey,
-                            data, &pubLen);
-                        if (ret == 0)
-                            *len = pubLen;
-                    }
-                }
-            }
-            else {
-                *len = CK_UNAVAILABLE_INFORMATION;
-                ret = NOT_AVAILABLE_E;
-            }
-            break;
-        default:
-            ret = NOT_AVAILABLE_E;
-            break;
-    }
-    return ret;
-}
-
-/* Validate a supplied CKA_HSS_LMS_TYPES / CKA_HSS_LMOTS_TYPES array against the
- * imported public key. wolfSSL uses uniform LMS/LMOTS parameters across all HSS
- * levels, so a conforming array holds one CK_ULONG per level, each equal to the
- * single top-level type served by HssObject_GetAttr. A wrong length or any
- * differing entry is rejected so a malformed or mismatched template is not
- * silently accepted; a matching array (as read back from this key) is accepted.
- * Returns 0 when the array matches, BAD_FUNC_ARG otherwise. The caller holds the
- * object lock. */
-static int wp11_HssCheckTypesAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
-                                  const byte* data, CK_ULONG len)
-{
-    int ret;
-    int levels = 0;
-    int height = 0;
-    int winternitz = 0;
-    int i;
-    CK_ULONG expected;
-    CK_ULONG entry;
-
-    if (object->data.lmsKey == NULL || data == NULL)
-        return BAD_FUNC_ARG;
-
-    ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels, &height,
-        &winternitz);
-    if (ret != 0)
-        return ret;
-
-    expected = (type == CKA_HSS_LMS_TYPES)
-        ? (CK_ULONG)wp11_HssHeightToLmsType(height)
-        : (CK_ULONG)wp11_HssWToLmotsType(winternitz);
-    if (expected == 0)
-        return BAD_FUNC_ARG;
-    if (len != (CK_ULONG)(sizeof(CK_ULONG) * levels))
-        return BAD_FUNC_ARG;
-
-    for (i = 0; i < levels; i++) {
-        XMEMCPY(&entry, data + i * sizeof(CK_ULONG), sizeof(entry));
-        if (entry != expected)
-            return BAD_FUNC_ARG;
-    }
-
-    return 0;
-}
-#endif /* WOLFPKCS11_LMS */
-
-#ifdef WOLFPKCS11_XMSS
-/* ===========================================================================
- * XMSS/XMSS^MT (RFC 8391): verification and public-key import.
- *
- * Verify-only. One wolfSSL XmssKey type serves both XMSS and XMSS^MT; the
- * PKCS#11 key type (CKK_XMSS vs CKK_XMSSMT) selects which via the is_xmssmt
- * flag. The raw public key carries the parameter-set OID in its leading
- * bytes, so wc_XmssKey_ImportPubRaw_ex derives the parameter set on import.
- * A CKA_PARAMETER_SET attribute is optional and, when supplied, is validated
- * against the OID in the key.
- * ========================================================================= */
-
-/* Length of the parameter-set OID prefix in a raw RFC 8391 public key. wolfSSL
- * only exposes XMSS_OID_LEN when built with WOLFSSL_HAVE_XMSS and it is absent
- * from some released headers, so define our own to keep the build independent
- * of the wolfSSL version. */
-#define WP11_XMSS_OID_LEN 4
-
-/* Big-endian 32-bit read from a byte buffer (used to read the XMSS OID). */
-static word32 wp11_HbsReadU32(const byte* p)
-{
-    return ((word32)p[0] << 24) | ((word32)p[1] << 16)
-         | ((word32)p[2] << 8)  |  (word32)p[3];
-}
-
-/* Import a raw XMSS/XMSS^MT public key into the given wolfSSL XmssKey, deriving
- * the parameter set from the embedded OID. is_xmssmt disambiguates the XMSS and
- * XMSS^MT OID namespaces (which overlap) and comes from the PKCS#11 key type.
- * When the caller supplies a CKA_PARAMETER_SET (params != NULL, the OID as a
- * CK_ULONG) it must match the OID in the public key. On failure the key is NOT
- * freed here; the caller owns it. */
-static int wp11_XmssImportPub(XmssKey* key, int is_xmssmt, int devId,
-    const byte* pub, word32 pubLen, const byte* params, word32 paramsLen)
-{
-    int ret;
-
-    ret = wc_XmssKey_Init(key, NULL, devId);
-    if (ret == 0 && params != NULL) {
-        CK_ULONG userOid;
-        if (paramsLen != sizeof(CK_ULONG) || pubLen < WP11_XMSS_OID_LEN) {
-            ret = BAD_FUNC_ARG;
-        }
-        else {
-            XMEMCPY(&userOid, params, sizeof(userOid));
-            if (userOid != (CK_ULONG)wp11_HbsReadU32(pub))
-                ret = BAD_FUNC_ARG;
-        }
-    }
-    if (ret == 0)
-        ret = wc_XmssKey_ImportPubRaw_ex(key, pub, pubLen, is_xmssmt);
-    return ret;
-}
-
-/* Serialize the public key: keyData holds the raw RFC 8391 public key. */
-static int wp11_Object_Encode_XmssKey(WP11_Object* object)
-{
-    int ret;
-    word32 pubLen = 0;
-
-    if (object->objClass != CKO_PUBLIC_KEY)
-        return NOT_AVAILABLE_E;
-
-    ret = wc_XmssKey_GetPubLen(object->data.xmssKey, &pubLen);
-    if (ret == 0) {
-        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        object->keyData = (unsigned char*)XMALLOC(pubLen, NULL,
-            DYNAMIC_TYPE_TMP_BUFFER);
-        if (object->keyData == NULL)
-            ret = MEMORY_E;
-    }
-    if (ret == 0) {
-        ret = wc_XmssKey_ExportPubRaw(object->data.xmssKey, object->keyData,
-            &pubLen);
-        if (ret == 0)
-            object->keyDataLen = (int)pubLen;
-    }
-    /* On failure release the buffer so a later store does not skip re-encoding
-     * (keyData != NULL) and persist an uninitialised buffer with a stale
-     * length. This is public key material only, so no zeroization is needed. */
-    if (ret != 0) {
-        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        object->keyData = NULL;
-        object->keyDataLen = 0;
-    }
-    return ret;
-}
-
-static int wp11_Object_Decode_XmssKey(WP11_Object* object)
-{
-    int ret;
-
-    if (object->objClass != CKO_PUBLIC_KEY)
-        return NOT_AVAILABLE_E;
-
-    /* Reload from the stored raw public key; wolfSSL re-derives the parameter
-     * set from the embedded OID (no separate parameter set is persisted). */
-    ret = wp11_XmssImportPub(object->data.xmssKey,
-        (object->type == CKK_XMSSMT) ? 1 : 0, object->devId, object->keyData,
-        (word32)object->keyDataLen, NULL, 0);
-    /* Object owns the key on all paths; encoded stays 0 for the single free in
-     * WP11_Object_Free. See wp11_Object_Decode_HssKey. */
-    object->encoded = 0;
-    return ret;
-}
-
-static int wp11_Object_Load_XmssKey(WP11_Object* object, int tokenId, int objId)
-{
-    int ret;
-    void* storage = NULL;
-
-    ret = wp11_storage_open_readonly(WOLFPKCS11_STORE_XMSSKEY_PUB, tokenId,
-        objId, &storage);
-    if (ret == 0) {
-        ret = wp11_storage_read_alloc_array(storage, &object->keyData,
-            &object->keyDataLen);
-        wp11_storage_close(storage);
-    }
-    return ret;
-}
-
-static int wp11_Object_Store_XmssKey(WP11_Object* object, int tokenId,
-    int objId)
-{
-    int ret = 0;
-    void* storage = NULL;
-
-    if (object->keyData == NULL)
-        ret = wp11_Object_Encode_XmssKey(object);
-    if (ret == 0)
-        ret = wp11_storage_open(WOLFPKCS11_STORE_XMSSKEY_PUB, tokenId, objId,
-            object->keyDataLen, &storage);
-    if (ret == 0) {
-        ret = wp11_storage_write_array(storage, object->keyData,
-            object->keyDataLen);
-        wp11_storage_close(storage);
-    }
-    return ret;
-}
-
-/* Import an XMSS/XMSS^MT public key from a C_CreateObject template. data[1] is
- * the raw RFC 8391 public key; data[0] (CKA_PARAMETER_SET, the OID as a
- * CK_ULONG) is optional and, when present, is validated against the key.
- * Private-key import is rejected. */
-int WP11_Object_SetXmssKey(WP11_Object* object, unsigned char** data,
-                           CK_ULONG* len)
-{
-    int ret = 0;
-    XmssKey* newKey = NULL;
-
-    if (object == NULL || data == NULL || len == NULL)
-        return BAD_FUNC_ARG;
-    if (object->objClass != CKO_PUBLIC_KEY)
-        return BAD_FUNC_ARG;
-    /* A public key must carry its value; an absent CKA_VALUE is an
-     * incomplete template (no keygen path fills it later). Reject it. */
-    if (data[1] == NULL)
-        return BAD_FUNC_ARG;
-
-    if (object->onToken)
-        WP11_Lock_LockRW(object->lock);
-
-    /* Import into a temporary key and swap it in only after it validates, so a
-     * failed re-import leaves the existing key unchanged (PKCS#11 requires a
-     * failed C_SetAttributeValue to be a no-op). */
-    newKey = (XmssKey*)XMALLOC(sizeof(XmssKey), NULL, DYNAMIC_TYPE_KEY);
-    if (newKey == NULL)
-        ret = MEMORY_E;
-    if (ret == 0) {
-        XMEMSET(newKey, 0, sizeof(XmssKey));
-        ret = wp11_XmssImportPub(newKey, (object->type == CKK_XMSSMT) ? 1 : 0,
-            object->devId, data[1], (word32)len[1], data[0], (word32)len[0]);
-    }
-    if (ret == 0) {
-        /* Replace the live key and drop the cached serialization so a later
-         * store re-encodes from the new key. */
-        if (object->data.xmssKey != NULL) {
-            if (!object->encoded)
-                wc_XmssKey_Free(object->data.xmssKey);
-            XFREE(object->data.xmssKey, NULL, DYNAMIC_TYPE_KEY);
-        }
-        object->data.xmssKey = newKey;
-        object->encoded = 0;
-        newKey = NULL;
-        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        object->keyData = NULL;
-        object->keyDataLen = 0;
-    }
-    if (newKey != NULL) {
-        wc_XmssKey_Free(newKey);
-        XFREE(newKey, NULL, DYNAMIC_TYPE_KEY);
-    }
-
-    if (object->onToken)
-        WP11_Lock_UnlockRW(object->lock);
-    return ret;
-}
-
-/* Verify an XMSS/XMSS^MT signature over a raw message. Stateless. */
-int WP11_Xmss_Verify(unsigned char* sig, word32 sigLen, unsigned char* data,
-                     word32 dataLen, int* stat, WP11_Object* pub)
-{
-    int ret;
-    word32 expSigLen = 0;
-
-    if (pub == NULL || pub->data.xmssKey == NULL || stat == NULL)
-        return BAD_FUNC_ARG;
-
-    /* Verification only reads the key: wc_XmssKey_Verify works from a locally
-     * allocated XmssState, so a shared RO lock is safe for concurrent verifies
-     * on the same token object. */
-    if (pub->onToken)
-        WP11_Lock_LockRO(pub->lock);
-
-    /* A wrong-length signature cannot be valid for this key; report it as an
-     * invalid signature rather than a function failure. wolfSSL's XMSS verify
-     * also rejects a zero-length message with BAD_FUNC_ARG; treat that the same
-     * way (an invalid verification, not an internal failure). */
-    if (wc_XmssKey_GetSigLen(pub->data.xmssKey, &expSigLen) == 0 &&
-            sigLen != expSigLen) {
-        *stat = 0;
-        ret = 0;
-    }
-    else if (dataLen == 0) {
-        *stat = 0;
-        ret = 0;
-    }
-    else {
-        ret = wc_XmssKey_Verify(pub->data.xmssKey, sig, sigLen, data,
-            (int)dataLen);
-        /* Only SIG_VERIFY_E maps to stat=0; other argument/state errors
-         * surface as a function failure so they are not silently reported as
-         * an invalid signature. */
-        if (ret == 0) {
-            *stat = 1;
-        }
-        else if (ret == SIG_VERIFY_E) {
-            *stat = 0;
-            ret = 0;
-        }
-        else {
-            *stat = 0;
-        }
-    }
-
-    if (pub->onToken)
-        WP11_Lock_UnlockRO(pub->lock);
-
-    return ret;
-}
-
-/* Serve XMSS-specific attributes from a public-key object. */
-static int XmssObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
-                              byte* data, CK_ULONG* len)
-{
-    int ret = 0;
-
-    if (object == NULL || object->data.xmssKey == NULL || len == NULL)
-        return BAD_FUNC_ARG;
-
-    switch (type) {
-        case CKA_VALUE:
-            if (object->objClass == CKO_PUBLIC_KEY) {
-                word32 pubLen = 0;
-                ret = wc_XmssKey_GetPubLen(object->data.xmssKey, &pubLen);
-                if (ret == 0) {
-                    if (data == NULL)
-                        *len = pubLen;
-                    else if (*len < pubLen) {
-                        *len = pubLen;
-                        ret = BUFFER_E;
-                    }
-                    else {
-                        ret = wc_XmssKey_ExportPubRaw(object->data.xmssKey,
-                            data, &pubLen);
-                        if (ret == 0)
-                            *len = pubLen;
-                    }
-                }
-            }
-            else {
-                *len = CK_UNAVAILABLE_INFORMATION;
-                ret = NOT_AVAILABLE_E;
-            }
-            break;
-        case CKA_PARAMETER_SET: {
-            /* The XMSS parameter set is identified by the OID in the leading
-             * bytes of the raw public key; return it as a CK_ULONG. */
-            CK_ULONG v;
-            word32 pubLen = 0;
-            byte* raw;
-
-            if (object->objClass != CKO_PUBLIC_KEY) {
-                *len = CK_UNAVAILABLE_INFORMATION;
-                ret = NOT_AVAILABLE_E;
-                break;
-            }
-            if (data == NULL) {
-                *len = sizeof(v);
-                break;
-            }
-            if (*len < sizeof(v)) {
-                *len = sizeof(v);
-                ret = BUFFER_E;
-                break;
-            }
-            ret = wc_XmssKey_GetPubLen(object->data.xmssKey, &pubLen);
-            if (ret == 0 && pubLen < WP11_XMSS_OID_LEN)
-                ret = NOT_AVAILABLE_E;
-            if (ret == 0) {
-                raw = (byte*)XMALLOC(pubLen, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-                if (raw == NULL) {
-                    ret = MEMORY_E;
-                }
-                else {
-                    ret = wc_XmssKey_ExportPubRaw(object->data.xmssKey, raw,
-                        &pubLen);
-                    if (ret == 0) {
-                        v = (CK_ULONG)wp11_HbsReadU32(raw);
-                        XMEMCPY(data, &v, sizeof(v));
-                        *len = sizeof(v);
-                    }
-                    XFREE(raw, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-                }
-            }
-            break;
-        }
-        default:
-            ret = NOT_AVAILABLE_E;
-            break;
-    }
-    return ret;
-}
-#endif /* WOLFPKCS11_XMSS */
 
 /**
  * Decode the symmetric key - requires decryption.
@@ -8246,26 +5814,15 @@ static int wp11_Object_Unstore(WP11_Object* object, int tokenId, int objId)
     #endif
     #ifdef WOLFPKCS11_LMS
         case CKK_HSS:
+            storeObjType = WOLFPKCS11_STORE_HSSKEY_PUB;
     #ifdef WOLFPKCS11_LMS_PRIVATE
             if (object->objClass == CKO_PRIVATE_KEY) {
-                /* Remove the encrypted signature-state file too. Recover the
-                 * per-key nonce from memory if decoded, else peek it from the
-                 * on-disk shell (validating magic/version). Otherwise the
-                 * state file would orphan on disk after C_DestroyObject. */
-                word64 stateId = object->statefulStateId;
-                if (stateId == 0) {
-                    (void)wp11_Hss_PeekStateIdFromShell(tokenId, objId,
-                        &stateId);
-                }
-                if (stateId != 0) {
-                    (void)wp11_Stateful_StateFile_Remove("hsskey", tokenId,
-                        stateId);
-                }
                 storeObjType = WOLFPKCS11_STORE_HSSKEY_PRIV;
-                break;
+                /* The signature-state file lives outside the object store and
+                 * would orphan on disk after C_DestroyObject. */
+                wp11_Hss_RemoveStoredState(object, tokenId, objId);
             }
     #endif
-            storeObjType = WOLFPKCS11_STORE_HSSKEY_PUB;
             break;
     #endif
     #ifdef WOLFPKCS11_XMSS

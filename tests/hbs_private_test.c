@@ -18,7 +18,7 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  *
- * Functional test for the EXPERIMENTAL sign-capable LMS/HSS build
+ * Functional test for the sign-capable LMS/HSS build
  * (--enable-lms-private / WOLFPKCS11_LMS_PRIVATE). Exercises the paths that
  * the verify-only tests cannot reach:
  *
