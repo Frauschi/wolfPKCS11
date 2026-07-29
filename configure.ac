@@ -630,8 +630,27 @@ then
     AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_LMS"
 fi
 
+# A verify-only wolfSSL LMS build has no wc_LmsKey_MakeKey/_Sign, which would
+# otherwise surface as a pile of errors deep in the compile of src/hbs.c. Catch
+# it here instead. WOLFSSL_LMS_VERIFY_ONLY is only visible when the installed
+# headers expose it, so probe the symbol rather than the macro.
 if test "$ENABLED_LMS_PRIVATE" = "yes"
 then
+    AC_MSG_CHECKING([for a sign-capable wolfSSL LMS build])
+    SAVED_LIBS="$LIBS"
+    LIBS="$LIBS -lwolfssl"
+    AC_LINK_IFELSE(
+        [AC_LANG_PROGRAM(
+            [[#include <wolfssl/options.h>
+              #include <wolfssl/wolfcrypt/random.h>
+              #include <wolfssl/wolfcrypt/wc_lms.h>]],
+            [[LmsKey* k = (LmsKey*)0; WC_RNG* r = (WC_RNG*)0;
+              return wc_LmsKey_MakeKey(k, r);]])],
+        [AC_MSG_RESULT([yes])],
+        [AC_MSG_RESULT([no])
+         AC_MSG_ERROR([--enable-lms-private needs a sign-capable wolfSSL LMS build; wolfSSL configured with --enable-lms=verify-only provides verification only. Rebuild wolfSSL with --enable-lms=yes.])])
+    LIBS="$SAVED_LIBS"
+
     AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_LMS_PRIVATE"
 fi
 

@@ -148,6 +148,22 @@ HSS signing is not secret-input timing-sensitive the way an RSA/ECC private
 scalar is (the message and the tree position are not confidential), so no
 constant-time treatment beyond the existing token-key handling is required.
 
+#### Known limitation: a spent or damaged key is hidden, not reportable
+
+An HSS private key whose state cannot be reloaded - because the tree is
+exhausted, or because the state file was damaged - stays flagged as undecoded,
+which is how this library already treats any object it cannot decode for the
+current user. Such an object is skipped by `C_FindObjects`.
+
+The token itself keeps working: `C_Login` succeeds and every other object on it
+stays usable. But the spent key is not enumerable, so it cannot be handed to
+`C_DestroyObject`; its object and state files have to be removed from the token
+directory by hand.
+
+Reporting the key instead of hiding it means quarantining objects individually
+in the shared decode-at-login path, which affects every key type. That is
+planned as a separate change.
+
 ### Build options and defines
 
 #### Define WOLFPKCS11_TPM_STORE

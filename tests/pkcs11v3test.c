@@ -3167,19 +3167,12 @@ static CK_RV hbs_empty_template_rejected(CK_SESSION_HANDLE session,
 
     ret = funcList->C_CreateObject(session, tmpl,
         sizeof(tmpl) / sizeof(*tmpl), &obj);
-#ifdef WOLFPKCS11_LMS_PRIVATE
-    if (keyType == CKK_HSS) {
-        /* Sign-capable build: an HSS public key with no CKA_VALUE is a valid
-         * deferred-keygen placeholder (C_GenerateKeyPair populates it), so it
-         * is accepted rather than rejected. */
-        CHECK_CKR(ret, "HSS empty-template public key (deferred keygen)");
-    }
-    else
-#endif
-    {
-        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
-            "HBS empty-template public key rejected");
-    }
+    /* This holds in a sign-capable build too. C_GenerateKeyPair does create
+     * both objects from templates with no key material, but that is internal
+     * to keygen; C_CreateObject has no second step that would fill the value
+     * in, so an empty template is still an incomplete one. */
+    CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+        "HBS empty-template public key rejected");
     if (obj != CK_INVALID_HANDLE)
         funcList->C_DestroyObject(session, obj);
     return ret;

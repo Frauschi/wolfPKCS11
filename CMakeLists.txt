@@ -474,7 +474,7 @@ endif()
 
 if(WOLFPKCS11_MLDSA)
     if(NOT WOLFPKCS11_PKCS11_V3_2)
-        message(STATUS "ML-DSA requires PKCS#11 v3.2 support — enabling WOLFPKCS11_PKCS11_V3_2 automatically")
+        message(STATUS "ML-DSA requires PKCS#11 v3.2 support - enabling WOLFPKCS11_PKCS11_V3_2 automatically")
         override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
         if(NOT WOLFPKCS11_PKCS11_V3_0)
             override_cache(WOLFPKCS11_PKCS11_V3_0 "yes")
@@ -498,7 +498,7 @@ endif()
 
 if(WOLFPKCS11_MLKEM)
     if(NOT WOLFPKCS11_PKCS11_V3_2)
-        message(STATUS "ML-KEM requires PKCS#11 v3.2 support — enabling WOLFPKCS11_PKCS11_V3_2 automatically")
+        message(STATUS "ML-KEM requires PKCS#11 v3.2 support - enabling WOLFPKCS11_PKCS11_V3_2 automatically")
         override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
         if(NOT WOLFPKCS11_PKCS11_V3_0)
             override_cache(WOLFPKCS11_PKCS11_V3_0 "yes")
@@ -522,7 +522,7 @@ endif()
 
 if(WOLFPKCS11_LMS)
     if(NOT WOLFPKCS11_PKCS11_V3_2)
-        message(STATUS "LMS/HSS requires PKCS#11 v3.2 support — enabling WOLFPKCS11_PKCS11_V3_2 automatically")
+        message(STATUS "LMS/HSS requires PKCS#11 v3.2 support - enabling WOLFPKCS11_PKCS11_V3_2 automatically")
         override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
         if(NOT WOLFPKCS11_PKCS11_V3_0)
             override_cache(WOLFPKCS11_PKCS11_V3_0 "yes")
@@ -548,7 +548,7 @@ if(WOLFPKCS11_LMS_PRIVATE AND NOT WOLFPKCS11_SHA256)
 endif()
 
 if(WOLFPKCS11_LMS_PRIVATE AND NOT WOLFPKCS11_LMS)
-    message(STATUS "WOLFPKCS11_LMS_PRIVATE requires WOLFPKCS11_LMS — enabling WOLFPKCS11_LMS automatically")
+    message(STATUS "WOLFPKCS11_LMS_PRIVATE requires WOLFPKCS11_LMS - enabling WOLFPKCS11_LMS automatically")
     override_cache(WOLFPKCS11_LMS "yes")
     if(NOT WOLFPKCS11_PKCS11_V3_2)
         override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
@@ -578,7 +578,7 @@ endif()
 
 if(WOLFPKCS11_XMSS)
     if(NOT WOLFPKCS11_PKCS11_V3_2)
-        message(STATUS "XMSS requires PKCS#11 v3.2 support — enabling WOLFPKCS11_PKCS11_V3_2 automatically")
+        message(STATUS "XMSS requires PKCS#11 v3.2 support - enabling WOLFPKCS11_PKCS11_V3_2 automatically")
         override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
         if(NOT WOLFPKCS11_PKCS11_V3_0)
             override_cache(WOLFPKCS11_PKCS11_V3_0 "yes")
@@ -818,6 +818,26 @@ if(WOLFPKCS11_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/hbs_persistence_test.c)
         set_tests_properties(hbs_persistence_test PROPERTIES SKIP_RETURN_CODE 77)
     endif()
+
+    # LMS/HSS keygen and signing tests. Both exit 77 (skip) when the feature is
+    # compiled out, so they can be registered unconditionally like the test
+    # above and still behave in a verify-only build.
+    #
+    # Each gets its own token directory. They wipe the store between sub-tests
+    # to start from a known state, which would clobber the other tests running
+    # beside them under `ctest -j`.
+    add_wpkcs11_test(hbs_private_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hbs_private_test.c)
+    set_tests_properties(hbs_private_test PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT
+            "WOLFPKCS11_TOKEN_PATH=${CMAKE_CURRENT_BINARY_DIR}/store-hbs-private")
+    add_wpkcs11_test(hss_concurrency_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hss_concurrency_test.c)
+    set_tests_properties(hss_concurrency_test PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT
+            "WOLFPKCS11_TOKEN_PATH=${CMAKE_CURRENT_BINARY_DIR}/store-hss-concurrency")
 endif()
 
 if(WOLFPKCS11_EXAMPLES)

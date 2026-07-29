@@ -603,12 +603,12 @@ WP11_LOCAL int wp11_storage_write_array(void* storage, unsigned char* buffer,
 
 #ifndef WOLFPKCS11_CUSTOM_STORE
 /* Report the result of the close-and-commit rather than discarding it. */
-WP11_LOCAL int wolfPKCS11_Store_CloseAndReport(void* store);
+WP11_LOCAL int wp11_storage_close_report(void* store);
 #ifdef WOLFPKCS11_STATEFUL_SIG_PRIVATE
 #ifndef WOLFPKCS11_TPM_STORE
 /* Ask the file store to fsync the data and its parent directory before the
  * atomic rename commits. */
-WP11_LOCAL void wolfPKCS11_Store_SetDurable(void* store, int durable);
+WP11_LOCAL void wp11_storage_set_durable(void* store, int durable);
 #endif
 
 /* Per-key state files for stateful hash-based signature schemes. Keyed by a

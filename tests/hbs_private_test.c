@@ -340,8 +340,10 @@ static CK_RV gen_hss_key(CK_SESSION_HANDLE session, CK_ULONG levels,
     return ret;
 }
 
-/* Find a single token object of the given class by CKA_ID. */
-static CK_RV find_by_id(CK_SESSION_HANDLE session, CK_OBJECT_CLASS cls,
+/* Find a single token object of the given class by CKA_ID, without reporting
+ * a miss. Tests that expect the object to be gone use this so a passing run
+ * never writes "FAIL" into test-suite.log. */
+static CK_RV find_by_id_quiet(CK_SESSION_HANDLE session, CK_OBJECT_CLASS cls,
     CK_BYTE* id, CK_ULONG idLen, CK_OBJECT_HANDLE* obj)
 {
     CK_RV ret;
@@ -353,17 +355,24 @@ static CK_RV find_by_id(CK_SESSION_HANDLE session, CK_OBJECT_CLASS cls,
 
     ret = funcList->C_FindObjectsInit(session, tmpl,
         sizeof(tmpl) / sizeof(*tmpl));
-    CHECK_CKR(ret, "FindObjectsInit");
     if (ret == CKR_OK) {
         ret = funcList->C_FindObjects(session, obj, 1, &count);
-        CHECK_CKR(ret, "FindObjects");
         funcList->C_FindObjectsFinal(session);
     }
-    if (ret == CKR_OK && count != 1) {
-        fprintf(stderr, "\nExpected 1 object, found %lu - FAIL\n",
-            (unsigned long)count);
+    if (ret == CKR_OK && count != 1)
         ret = CKR_GENERAL_ERROR;
-    }
+    return ret;
+}
+
+/* Find a single token object of the given class by CKA_ID. Reports a miss,
+ * so only use it where the object is expected to be present. */
+static CK_RV find_by_id(CK_SESSION_HANDLE session, CK_OBJECT_CLASS cls,
+    CK_BYTE* id, CK_ULONG idLen, CK_OBJECT_HANDLE* obj)
+{
+    CK_RV ret = find_by_id_quiet(session, cls, id, idLen, obj);
+
+    if (ret != CKR_OK)
+        fprintf(stderr, "\nExpected 1 object with the given CKA_ID - FAIL\n");
     return ret;
 }
 
@@ -979,7 +988,7 @@ static CK_RV test_state_tamper_detected(void)
             printf("    tamper detected at login: %lx\n",
                 (unsigned long)rret);
         }
-        else if (find_by_id(session, CKO_PRIVATE_KEY, id, sizeof(id) - 1,
+        else if (find_by_id_quiet(session, CKO_PRIVATE_KEY, id, sizeof(id) - 1,
                      &priv) != CKR_OK) {
             printf("    tampered key not usable after login\n");
         }
@@ -1012,6 +1021,9 @@ static CK_RV test_write_failure_poison(void)
     static CK_BYTE id[] = "hss-wfail";
     CK_BYTE* sig = NULL;
     CK_ULONG sigLen = 0, before = 0, after = 0;
+    struct stat dirStat;
+    int dirModeSaved = 0;
+    int skipInjection = 0;
 
     printf("  state-write failure poisons the key...\n");
     ret = fresh_token(&session);
@@ -1031,10 +1043,22 @@ static CK_RV test_write_failure_poison(void)
     }
     if (ret == CKR_OK)
         ret = get_keys_remaining(session, priv, &before);
-    /* Make the store directory unwritable so the durable state write fails. */
-    if (ret == CKR_OK && chmod(storeDir, 0500) != 0)
-        ret = CKR_GENERAL_ERROR;
-    if (ret == CKR_OK) {
+    /* Make the store directory unwritable so the durable state write fails.
+     * Root bypasses DAC permission checks, so the write would still succeed
+     * and the assertion below would fail for a reason that says nothing about
+     * the code under test. */
+    if (ret == CKR_OK && geteuid() == 0) {
+        printf("    skipping write-failure injection (running as root)\n");
+        skipInjection = 1;
+    }
+    if (ret == CKR_OK && !skipInjection) {
+        /* Capture the real mode so it can be put back exactly. */
+        if (stat(storeDir, &dirStat) != 0 || chmod(storeDir, 0500) != 0)
+            ret = CKR_GENERAL_ERROR;
+        else
+            dirModeSaved = 1;
+    }
+    if (ret == CKR_OK && !skipInjection) {
         sret = hss_sign(session, priv, &sig, &sigLen);
         if (sret == CKR_OK) {
             fprintf(stderr, "\nsigned despite an unwritable store - FAIL\n");
@@ -1048,7 +1072,10 @@ static CK_RV test_write_failure_poison(void)
             printf("    write-failed sign refused: %lx\n", (unsigned long)sret);
         }
     }
-    (void)chmod(storeDir, 0700);   /* restore, even on failure */
+    if (dirModeSaved)
+        (void)chmod(storeDir, dirStat.st_mode);   /* restore, even on failure */
+    if (skipInjection)
+        return ret;
     /* The key is poisoned until reloaded: the next sign is CKR_DEVICE_ERROR. */
     if (ret == CKR_OK) {
         sret = hss_sign(session, priv, &sig, &sigLen);
@@ -1258,7 +1285,8 @@ static CK_RV corrupt_state_and_check(const char* label, int type)
         printf("      detected at login: %lx\n", (unsigned long)ret);
         ret = CKR_OK;
     }
-    else if (find_by_id(session, CKO_PRIVATE_KEY, id, sizeof(id) - 1, &priv)
+    else if (find_by_id_quiet(session, CKO_PRIVATE_KEY, id, sizeof(id) - 1,
+                 &priv)
                  != CKR_OK) {
         printf("      key not usable after corruption\n");
     }
@@ -1468,6 +1496,298 @@ static CK_RV test_multilevel_rollover(void)
     return ret;
 }
 
+/* Destroying an unrelated token object renumbers the survivors, which unstores
+ * and re-stores them. The re-store rewrites only the object shell, so if the
+ * renumbering path also dropped the signature-state file the surviving private
+ * key would be permanently unusable. Destroy the PUBLIC key, which sits after
+ * the private key in the token list and so forces the private key through the
+ * renumbering loop, then reload and sign. */
+static CK_RV test_destroy_sibling_keeps_state(void)
+{
+    CK_RV ret;
+    CK_SESSION_HANDLE session = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
+    CK_BYTE id[] = "hss-sibling";
+    CK_BYTE* sig = NULL;
+    CK_ULONG sigLen = 0;
+
+    printf("  destroying the public key keeps the private state...\n");
+    ret = fresh_token(&session);
+    if (ret == CKR_OK) {
+        ret = gen_hss_key(session, hssLevels, hssLmsType, hssLmotsType,
+            id, sizeof(id) - 1, &pub, &priv);
+        CHECK_CKR(ret, "keygen");
+    }
+    /* One signature so the on-disk state is past the genesis index. */
+    if (ret == CKR_OK) {
+        ret = hss_sign(session, priv, &sig, &sigLen);
+        CHECK_CKR(ret, "baseline sign");
+        if (sig != NULL) {
+            XFREE(sig, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            sig = NULL;
+        }
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_DestroyObject(session, pub);
+        CHECK_CKR(ret, "C_DestroyObject(public)");
+    }
+    close_session(session);
+    pkcs11_final();
+
+    /* Reload the token: the private key must still decode and sign. */
+    if (ret == CKR_OK) {
+        ret = reopen_token(&session);
+        CHECK_CKR(ret, "reopen after destroying the public key");
+    }
+    if (ret == CKR_OK) {
+        ret = find_by_id(session, CKO_PRIVATE_KEY, id, sizeof(id) - 1, &priv);
+        CHECK_CKR(ret, "private key survived");
+    }
+    if (ret == CKR_OK) {
+        ret = hss_sign(session, priv, &sig, &sigLen);
+        CHECK_CKR(ret, "sign after the sibling was destroyed");
+        if (sig != NULL) {
+            XFREE(sig, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            sig = NULL;
+        }
+        if (ret == CKR_OK)
+            printf("    private key still signs\n");
+    }
+    close_session(session);
+    pkcs11_final();
+    return ret;
+}
+
+/* A spent key cannot be reloaded - wolfSSL rejects a key with no signatures
+ * left. That must not take the whole token down: C_Login has to succeed so the
+ * other objects stay reachable, while the spent key itself reports
+ * CKR_DEVICE_ERROR. */
+static CK_RV test_exhausted_key_login(void)
+{
+    CK_RV ret, sret;
+    CK_SESSION_HANDLE session = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE aes = CK_INVALID_HANDLE;
+    CK_BYTE id[] = "hss-spent";
+    CK_BYTE aesId[] = "aes-bystander";
+    CK_MECHANISM mech;
+    CK_BYTE sig[4096];
+    CK_ULONG sigLen;
+    int i;
+    CK_OBJECT_CLASS secretClass = CKO_SECRET_KEY;
+    CK_KEY_TYPE aesType = CKK_AES;
+    CK_BYTE aesKey[32] = { 0 };
+    CK_ATTRIBUTE aesTmpl[] = {
+        { CKA_CLASS,    &secretClass, sizeof(secretClass) },
+        { CKA_KEY_TYPE, &aesType,     sizeof(aesType)     },
+        { CKA_TOKEN,    &ckTrue,      sizeof(ckTrue)      },
+        { CKA_ID,       aesId,        sizeof(aesId) - 1   },
+        { CKA_VALUE,    aesKey,       sizeof(aesKey)      },
+    };
+
+    mech.mechanism = CKM_HSS;
+    mech.pParameter = NULL;
+    mech.ulParameterLen = 0;
+
+    printf("  an exhausted key does not break login for the token...\n");
+    ret = fresh_token(&session);
+    if (ret == CKR_OK) {
+        ret = gen_hss_key(session, hssLevels, hssLmsType, hssLmotsType,
+            id, sizeof(id) - 1, &pub, &priv);
+        CHECK_CKR(ret, "keygen");
+    }
+    /* An unrelated token object that must remain reachable afterwards. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(session, aesTmpl,
+            sizeof(aesTmpl) / sizeof(*aesTmpl), &aes);
+        CHECK_CKR(ret, "create bystander AES key");
+    }
+    /* Spend the whole tree. */
+    for (i = 0; ret == CKR_OK && i < HSS_H5_SIGS + 4; i++) {
+        sret = funcList->C_SignInit(session, &mech, priv);
+        if (sret != CKR_OK)
+            break;
+        sigLen = sizeof(sig);
+        sret = funcList->C_Sign(session, (CK_BYTE*)testMsg, TEST_MSG_LEN, sig,
+            &sigLen);
+        if (sret != CKR_OK)
+            break;
+    }
+    close_session(session);
+    pkcs11_final();
+
+    /* The whole point: login must still work. */
+    if (ret == CKR_OK) {
+        ret = reopen_token(&session);
+        CHECK_CKR(ret, "C_Login with an exhausted HSS key on the token");
+    }
+    if (ret == CKR_OK) {
+        ret = find_by_id(session, CKO_SECRET_KEY, aesId, sizeof(aesId) - 1,
+            &aes);
+        CHECK_CKR(ret, "bystander key still reachable");
+    }
+    if (ret == CKR_OK) {
+        printf("    login succeeded, other objects reachable\n");
+        /* A key whose state cannot be reloaded stays flagged as undecoded,
+         * which is how this library already treats any object it could not
+         * decode for the current user: wp11_Session_FindNext skips it. So the
+         * spent key is not enumerable rather than enumerable-but-erroring.
+         * Assert that, and that it is the ONLY thing lost - the token and its
+         * other objects keep working. */
+        if (find_by_id_quiet(session, CKO_PRIVATE_KEY, id, sizeof(id) - 1,
+                &priv) == CKR_OK) {
+            /* Should it become enumerable one day, it must still refuse. */
+            sret = funcList->C_SignInit(session, &mech, priv);
+            if (sret == CKR_OK) {
+                sigLen = sizeof(sig);
+                sret = funcList->C_Sign(session, (CK_BYTE*)testMsg,
+                    TEST_MSG_LEN, sig, &sigLen);
+            }
+            CHECK_CKR_FAIL(sret, CKR_DEVICE_ERROR, "spent-key sign");
+            if (sret != CKR_DEVICE_ERROR)
+                ret = CKR_GENERAL_ERROR;
+            else
+                printf("    spent key reports CKR_DEVICE_ERROR\n");
+        }
+        else {
+            printf("    spent key not enumerable, token otherwise intact\n");
+        }
+    }
+    /* The bystander key must still be usable and destroyable, proving the
+     * token is fully operational and not merely loggable-into. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_DestroyObject(session, aes);
+        CHECK_CKR(ret, "C_DestroyObject on the bystander key");
+    }
+    close_session(session);
+    pkcs11_final();
+    return ret;
+}
+
+/* C_Logout re-encodes the live objects with protect set, which releases the
+ * signing key; the next C_Login decodes it again from the durable state. Both
+ * halves happen inside one C_Initialize, a path no other test covers. Run it
+ * twice so a leak or a stale key surfaces on the second cycle. */
+static CK_RV test_logout_login_cycle(void)
+{
+    CK_RV ret;
+    CK_SESSION_HANDLE session = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
+    CK_BYTE id[] = "hss-cycle";
+    CK_BYTE* sig = NULL;
+    CK_ULONG sigLen = 0;
+    CK_ULONG remaining = 0, prevRemaining = 0;
+    int cycle;
+
+    printf("  logout/login cycle keeps the key usable...\n");
+    ret = fresh_token(&session);
+    if (ret == CKR_OK) {
+        ret = gen_hss_key(session, hssLevels, hssLmsType, hssLmotsType,
+            id, sizeof(id) - 1, &pub, &priv);
+        CHECK_CKR(ret, "keygen");
+    }
+    if (ret == CKR_OK)
+        ret = get_keys_remaining(session, priv, &prevRemaining);
+
+    for (cycle = 0; ret == CKR_OK && cycle < 2; cycle++) {
+        if (ret == CKR_OK) {
+            ret = funcList->C_Logout(session);
+            CHECK_CKR(ret, "C_Logout");
+        }
+        if (ret == CKR_OK) {
+            ret = funcList->C_Login(session, CKU_USER, userPin, userPinLen);
+            CHECK_CKR(ret, "C_Login after logout");
+        }
+        if (ret == CKR_OK) {
+            ret = find_by_id(session, CKO_PRIVATE_KEY, id, sizeof(id) - 1,
+                &priv);
+            CHECK_CKR(ret, "private key after re-login");
+        }
+        if (ret == CKR_OK) {
+            ret = hss_sign(session, priv, &sig, &sigLen);
+            CHECK_CKR(ret, "sign after re-login");
+        }
+        if (ret == CKR_OK) {
+            ret = find_by_id(session, CKO_PUBLIC_KEY, id, sizeof(id) - 1,
+                &pub);
+        }
+        if (ret == CKR_OK)
+            ret = hss_verify(session, pub, sig, sigLen);
+        if (sig != NULL) {
+            XFREE(sig, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            sig = NULL;
+        }
+        /* The index must move forward across the cycle, never back. */
+        if (ret == CKR_OK) {
+            ret = get_keys_remaining(session, priv, &remaining);
+            CHECK_CKR(ret, "keys-remaining after cycle");
+        }
+        if (ret == CKR_OK && remaining >= prevRemaining) {
+            fprintf(stderr,
+                "\nkeys-remaining did not advance across cycle %d "
+                "(%lu -> %lu) - FAIL\n", cycle,
+                (unsigned long)prevRemaining, (unsigned long)remaining);
+            ret = CKR_GENERAL_ERROR;
+        }
+        prevRemaining = remaining;
+    }
+    if (ret == CKR_OK)
+        printf("    two logout/login cycles, state advanced each time\n");
+    close_session(session);
+    pkcs11_final();
+    return ret;
+}
+
+/* A second C_SignInit while an HSS signing operation is already active must be
+ * refused. This only works if WP11_INIT_HSS_SIGN is registered as a sign-class
+ * operation; if it is not, the second init silently replaces the first. */
+static CK_RV test_sign_init_operation_active(void)
+{
+    CK_RV ret, sret;
+    CK_SESSION_HANDLE session = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE, priv = CK_INVALID_HANDLE;
+    CK_BYTE id[] = "hss-active";
+    CK_MECHANISM mech;
+    CK_BYTE sig[4096];
+    CK_ULONG sigLen;
+
+    mech.mechanism = CKM_HSS;
+    mech.pParameter = NULL;
+    mech.ulParameterLen = 0;
+
+    printf("  a second C_SignInit is refused while one is active...\n");
+    ret = fresh_token(&session);
+    if (ret == CKR_OK) {
+        ret = gen_hss_key(session, hssLevels, hssLmsType, hssLmotsType,
+            id, sizeof(id) - 1, &pub, &priv);
+        CHECK_CKR(ret, "keygen");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_SignInit(session, &mech, priv);
+        CHECK_CKR(ret, "first C_SignInit");
+    }
+    if (ret == CKR_OK) {
+        sret = funcList->C_SignInit(session, &mech, priv);
+        CHECK_CKR_FAIL(sret, CKR_OPERATION_ACTIVE, "second C_SignInit");
+        if (sret != CKR_OPERATION_ACTIVE)
+            ret = CKR_GENERAL_ERROR;
+        else
+            printf("    second C_SignInit returned CKR_OPERATION_ACTIVE\n");
+    }
+    /* The first operation must still be the live one and complete normally. */
+    if (ret == CKR_OK) {
+        sigLen = sizeof(sig);
+        ret = funcList->C_Sign(session, (CK_BYTE*)testMsg, TEST_MSG_LEN, sig,
+            &sigLen);
+        CHECK_CKR(ret, "C_Sign completes the original operation");
+    }
+    if (ret == CKR_OK)
+        ret = hss_verify(session, pub, sig, sigLen);
+    close_session(session);
+    pkcs11_final();
+    return ret;
+}
+
 static CK_RV run_all(void)
 {
     CK_RV ret;
@@ -1483,6 +1803,14 @@ static CK_RV run_all(void)
         ret = test_import_value_rejected();
     if (ret == CKR_OK)
         ret = test_exhaustion_poison();
+    if (ret == CKR_OK)
+        ret = test_sign_init_operation_active();
+    if (ret == CKR_OK)
+        ret = test_exhausted_key_login();
+    if (ret == CKR_OK)
+        ret = test_logout_login_cycle();
+    if (ret == CKR_OK)
+        ret = test_destroy_sibling_keeps_state();
     if (ret == CKR_OK)
         ret = test_param_matrix();
     if (ret == CKR_OK)

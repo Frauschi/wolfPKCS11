@@ -145,6 +145,9 @@ C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT"
 #if defined(WOLFPKCS11_LMS_PRIVATE) && defined(WOLFPKCS11_TPM_STORE)
 #error WOLFPKCS11_LMS_PRIVATE is incompatible with WOLFPKCS11_TPM_STORE (encrypted state blobs exceed TPM NV capacity).
 #endif
+#if defined(WOLFPKCS11_LMS_PRIVATE) && defined(WOLFPKCS11_CUSTOM_STORE)
+#error WOLFPKCS11_LMS_PRIVATE is incompatible with WOLFPKCS11_CUSTOM_STORE (the durable signature-state file needs the built-in file store).
+#endif
 
 /* Stateful hash-based signature framework selector. _PRIVATE gates the
  * encrypted durable-state infrastructure (keygen + signing); it is compiled

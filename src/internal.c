@@ -654,7 +654,7 @@ typedef struct WP11_FileStoreCtx {
 /* Mark a write-mode file storage context as requiring full durability (fsync
  * of file data + parent directory) before the close path returns success.
  * Call after the store is opened for write, before writing. */
-void wolfPKCS11_Store_SetDurable(void* store, int durable)
+void wp11_storage_set_durable(void* store, int durable)
 {
 #ifndef WOLFPKCS11_TPM_STORE
     WP11_FileStoreCtx* ctx = (WP11_FileStoreCtx*)store;
@@ -1316,7 +1316,7 @@ int wolfPKCS11_Store_Open(int type, CK_ULONG id1, CK_ULONG id2, int read,
  * @return  0 on success.
  * @return  Other value when a durable flush or the temp-file commit failed.
  */
-int wolfPKCS11_Store_CloseAndReport(void* store)
+int wp11_storage_close_report(void* store)
 {
 #ifdef WOLFPKCS11_TPM_STORE
     WP11_TpmStore* tpmStore = (WP11_TpmStore*)store;
@@ -1347,24 +1347,47 @@ int wolfPKCS11_Store_CloseAndReport(void* store)
              * rename in CommitTemp commits a fully-persisted file. POSIX uses
              * fsync(); Windows/MSVC uses _commit() (FlushFileBuffers under the
              * hood) because MoveFileExA's MOVEFILE_WRITE_THROUGH makes only the
-             * rename durable, not the file data buffered before close. */
+             * rename durable, not the file data buffered before close.
+             *
+             * Every result here has to be checked. fsync only pushes what the
+             * kernel already holds, so bytes still sitting in the stdio buffer
+             * are invisible to it: a failed XFFLUSH followed by a successful
+             * fsync on an empty queue would otherwise look like a clean
+             * durable write. XFCLOSE is the last chance to learn about a
+             * deferred write error. */
             if (ctx->durable && ctx->is_write) {
-                (void)XFFLUSH(ctx->file);
+                if (XFFLUSH(ctx->file) != 0)
+                    fsyncFailed = 1;
 #if defined(_WIN32) || defined(_MSC_VER)
-                if (_commit(_fileno(ctx->file)) != 0)
+                if (!fsyncFailed && _commit(_fileno(ctx->file)) != 0)
                     fsyncFailed = 1;
 #else
-                fd = fileno(ctx->file);
-                if (fd < 0 || fsync(fd) != 0)
-                    fsyncFailed = 1;
+                if (!fsyncFailed) {
+                    fd = fileno(ctx->file);
+                    if (fd < 0 || fsync(fd) != 0)
+                        fsyncFailed = 1;
+                }
 #endif
+                if (XFCLOSE(ctx->file) != 0)
+                    fsyncFailed = 1;
+                ctx->file = XBADFILE;
             }
 #endif
-            XFCLOSE(ctx->file);
-            ctx->file = XBADFILE;
+            if (ctx->file != XBADFILE && ctx->file != NULL) {
+                XFCLOSE(ctx->file);
+                ctx->file = XBADFILE;
+            }
         }
 
-        if (ctx->is_write && ctx->has_temp) {
+        /* A durable write that did not reach stable storage must not replace
+         * the file that is already there. Renaming the temp file over it would
+         * swap a known-good state file for one that may be short or empty,
+         * turning a transient I/O error into permanent loss of the key. */
+        if (fsyncFailed) {
+            wolfPKCS11_StoreAbortTemp(ctx);
+            ret = READ_ONLY_E;
+        }
+        else if (ctx->is_write && ctx->has_temp) {
             commitRet = wolfPKCS11_StoreCommitTemp(ctx);
             if (commitRet != 0) {
                 wolfPKCS11_StoreAbortTemp(ctx);
@@ -1379,9 +1402,6 @@ int wolfPKCS11_Store_CloseAndReport(void* store)
             wolfPKCS11_StoreAbortTemp(ctx);
         }
 
-        if (ret == 0 && fsyncFailed)
-            ret = READ_ONLY_E;
-
         XMEMSET(ctx, 0, sizeof(*ctx));
         XFREE(ctx, NULL, DYNAMIC_TYPE_TMP_BUFFER);
     }
@@ -1391,11 +1411,13 @@ int wolfPKCS11_Store_CloseAndReport(void* store)
 
 /* wolfPKCS11_Store_Close is the store backend interface declared in
  * wolfpkcs11/store.h and reimplemented by WOLFPKCS11_CUSTOM_STORE builds, so
- * it keeps its void return; callers that need the commit result use
- * wolfPKCS11_Store_CloseAndReport above instead. */
+ * it keeps its void return. Internal callers that need the commit result use
+ * wp11_storage_close_report above, which stays in the wp11_storage_* namespace
+ * the other internal wrappers use so it cannot be mistaken for part of the
+ * backend contract. */
 void wolfPKCS11_Store_Close(void* store)
 {
-    (void)wolfPKCS11_Store_CloseAndReport(store);
+    (void)wp11_storage_close_report(store);
 }
 
 /**
@@ -5609,6 +5631,19 @@ static int wp11_Object_Decode(WP11_Object* object)
         #ifdef WOLFPKCS11_LMS
             case CKK_HSS:
                 ret = wp11_Object_Decode_HssKey(object);
+        #ifdef WOLFPKCS11_LMS_PRIVATE
+                /* A stateful private key that cannot be reloaded must not take
+                 * the whole token down with it. wc_LmsKey_Reload fails for an
+                 * exhausted key as well as a damaged one, and exhaustion is
+                 * the normal end of life for every LMS key, so this is an
+                 * expected outcome rather than an error. Decode_HssKey has
+                 * already left the object poisoned, which makes C_Sign on it
+                 * return CKR_DEVICE_ERROR while every other object on the
+                 * token stays usable - including for the C_DestroyObject that
+                 * clears the spent key. */
+                if (ret != 0 && object->objClass == CKO_PRIVATE_KEY)
+                    ret = 0;
+        #endif
                 break;
         #endif
         #ifdef WOLFPKCS11_XMSS
@@ -5707,6 +5742,20 @@ static int wp11_Object_Encode(WP11_Object* object, int protect)
         #ifdef WOLFPKCS11_LMS
             case CKK_HSS:
                 ret = wp11_Object_Encode_HssKey(object);
+        #ifdef WOLFPKCS11_LMS_PRIVATE
+                if (protect && ret == 0 && object->objClass == CKO_PRIVATE_KEY) {
+                    /* Release the live signing key like the other private-key
+                     * types do. wc_LmsKey_Free is what frees the heap-allocated
+                     * priv_data and zeroizes the raw private key; a later
+                     * wc_LmsKey_Init would only memset the handle and leak it.
+                     * The durable state file is untouched, so the next login
+                     * reloads the key from it. */
+                    wc_LmsKey_Free(object->data.lmsKey);
+                    object->encoded = 1;
+                    /* The state is no longer live in memory. */
+                    object->opFlag &= ~WP11_FLAG_STATEFUL_STATE_VALID;
+                }
+        #endif
                 break;
         #endif
         #ifdef WOLFPKCS11_XMSS
@@ -5738,11 +5787,21 @@ static int wp11_Object_Encode(WP11_Object* object, int protect)
  *
  * Empties the contents of the object.
  *
- * @param [in]  object   Key object.
- * @param [in]  tokenId  Id of token this key belongs to.
- * @param [in]  objId    Id of object for token.
+ * Called for two different reasons, which the destroying flag separates. When
+ * an object is really being removed from the token it is 1, and state held
+ * outside the object store goes with it. When a surviving object is only being
+ * renumbered after some other object was removed, it is 0: the caller unstores
+ * it at its old id and re-stores it at the new one, so anything that is not
+ * keyed by the object id must be left alone.
+ *
+ * @param [in]  object      Key object.
+ * @param [in]  tokenId     Id of token this key belongs to.
+ * @param [in]  objId       Id of object for token.
+ * @param [in]  destroying  1 when the object is being removed, 0 when it is
+ *                          only being renumbered.
  */
-static int wp11_Object_Unstore(WP11_Object* object, int tokenId, int objId)
+static int wp11_Object_Unstore(WP11_Object* object, int tokenId, int objId,
+                               int destroying)
 {
     int ret;
     int storeObjType = -1;
@@ -5819,8 +5878,12 @@ static int wp11_Object_Unstore(WP11_Object* object, int tokenId, int objId)
             if (object->objClass == CKO_PRIVATE_KEY) {
                 storeObjType = WOLFPKCS11_STORE_HSSKEY_PRIV;
                 /* The signature-state file lives outside the object store and
-                 * would orphan on disk after C_DestroyObject. */
-                wp11_Hss_RemoveStoredState(object, tokenId, objId);
+                 * would orphan on disk after C_DestroyObject. It is keyed by
+                 * the per-key nonce rather than the object id, so re-storing a
+                 * renumbered object would never recreate it - only remove it
+                 * when the key really is going away. */
+                if (destroying)
+                    wp11_Hss_RemoveStoredState(object, tokenId, objId);
             }
     #endif
             break;
@@ -6572,6 +6635,12 @@ int WP11_Library_Init(void)
 #endif
 
     if (libraryInitCount == 0) {
+#ifdef WOLFPKCS11_STATEFUL_SIG_PRIVATE
+        /* Resolve the relax-fsync setting once, here, while only one thread
+         * can be running - the sign path reads it without a lock that would
+         * cover a lazy initialiser. */
+        WP11_Stateful_InitRelaxFsync();
+#endif
         ret = WP11_Lock_Init(&globalLock);
         if (ret == 0) {
 
@@ -7813,6 +7882,9 @@ static int wp11_init_get_op_category(int init)
         case WP11_INIT_AES_CMAC_SIGN:
         case WP11_INIT_TLS_MAC_SIGN:
         case WP11_INIT_MLDSA_SIGN:
+#ifdef WOLFPKCS11_LMS_PRIVATE
+        case WP11_INIT_HSS_SIGN:
+#endif
             return WP11_OP_SIGN;
 
         case WP11_INIT_HMAC_VERIFY:
@@ -8804,7 +8876,8 @@ int WP11_Session_RemoveObjectByHandle(WP11_Session* session,
 
         #ifndef WOLFPKCS11_NO_STORE
             /* remove any id's with higher value */
-            ret = wp11_Object_Unstore(*curr, (int)session->slotId, id);
+            /* Renumbering a surviving object, not destroying it. */
+            ret = wp11_Object_Unstore(*curr, (int)session->slotId, id, 0);
         #ifdef DEBUG_WOLFPKCS11
             if (ret != 0) {
                 printf("Failed to unstore slot %d, id: %d, ret: %d, continuing...\n",
@@ -8819,7 +8892,7 @@ int WP11_Session_RemoveObjectByHandle(WP11_Session* session,
         }
 
     #ifndef WOLFPKCS11_NO_STORE
-        ret = wp11_Object_Unstore(object, (int)session->slotId, id);
+        ret = wp11_Object_Unstore(object, (int)session->slotId, id, 1);
     #ifdef DEBUG_WOLFPKCS11
         if (ret != 0) {
             printf("Failed to unstore slot %d, id: %d, ret: %d\n",

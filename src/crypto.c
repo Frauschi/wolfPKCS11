@@ -1516,6 +1516,23 @@ static CK_RV CreateObject(WP11_Session* session, CK_ATTRIBUTE_PTR pTemplate,
         }
     }
 
+#ifdef WOLFPKCS11_LMS_PRIVATE
+    /* A sign-capable build lets an HSS key object be created empty, because
+     * C_GenerateKeyPair builds both objects from templates that carry no key
+     * material and fills them in afterwards. C_CreateObject has no such second
+     * step, so an HSS public key imported without CKA_VALUE would be a
+     * permanently unusable object whose first C_Verify fails inside wolfSSL.
+     * Require the value here, matching what a verify-only build enforces in
+     * WP11_Object_SetHssKey. */
+    if (objType == CKK_HSS && objectClass == CKO_PUBLIC_KEY) {
+        CK_ATTRIBUTE_PTR value = NULL;
+
+        FindAttributeType(pTemplate, ulCount, CKA_VALUE, &value);
+        if (value == NULL || value->pValue == NULL || value->ulValueLen == 0)
+            return CKR_ATTRIBUTE_VALUE_INVALID;
+    }
+#endif
+
     rv = NewObject(session, objType, objectClass, pTemplate, ulCount, object);
 
     return rv;
@@ -7861,18 +7878,17 @@ static int HssTemplateIsToken(CK_ATTRIBUTE_PTR pTemplate, CK_ULONG ulCount)
            *(CK_BBOOL*)attr->pValue == CK_TRUE;
 }
 
-/* Stateful keys must be token-resident: a session-only key that vanishes on a
- * crash could release a signature whose one-time index was never persisted.
- * Both arms of the key pair must ask for CKA_TOKEN=TRUE explicitly. */
-static CK_RV HssKeyPairGenCheckToken(CK_ATTRIBUTE_PTR pPublicKeyTemplate,
-                                     CK_ULONG ulPublicKeyAttributeCount,
-                                     CK_ATTRIBUTE_PTR pPrivateKeyTemplate,
+/* The private key must be token-resident: a session-only key that vanishes on
+ * a crash could release a signature whose one-time index was never persisted,
+ * and the durable state file is only written for token objects. A public key
+ * holds no state, so it may be session-scoped like any other public key -
+ * requiring CKA_TOKEN on that arm too would be stricter than every other
+ * keygen mechanism here, for no safety gain. */
+static CK_RV HssKeyPairGenCheckToken(CK_ATTRIBUTE_PTR pPrivateKeyTemplate,
                                      CK_ULONG ulPrivateKeyAttributeCount)
 {
-    if (!HssTemplateIsToken(pPublicKeyTemplate, ulPublicKeyAttributeCount) ||
-        !HssTemplateIsToken(pPrivateKeyTemplate, ulPrivateKeyAttributeCount)) {
+    if (!HssTemplateIsToken(pPrivateKeyTemplate, ulPrivateKeyAttributeCount))
         return CKR_TEMPLATE_INCONSISTENT;
-    }
     return CKR_OK;
 }
 
@@ -8075,8 +8091,7 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
                     pMechanism->ulParameterLen != 0) {
                 return CKR_MECHANISM_PARAM_INVALID;
             }
-            rv = HssKeyPairGenCheckToken(pPublicKeyTemplate,
-                ulPublicKeyAttributeCount, pPrivateKeyTemplate,
+            rv = HssKeyPairGenCheckToken(pPrivateKeyTemplate,
                 ulPrivateKeyAttributeCount);
             if (rv != CKR_OK)
                 return rv;

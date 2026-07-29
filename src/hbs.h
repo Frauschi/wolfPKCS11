@@ -32,6 +32,12 @@
 
 #include "wp11_types.h"
 
+#ifdef WOLFPKCS11_STATEFUL_SIG_PRIVATE
+/* Read WOLFPKCS11_STATEFUL_RELAX_FSYNC once during library init, before any
+ * signing thread exists. */
+WP11_LOCAL void WP11_Stateful_InitRelaxFsync(void);
+#endif
+
 #ifdef WOLFPKCS11_LMS
 
 WP11_LOCAL int wp11_Object_Encode_HssKey(WP11_Object* object);

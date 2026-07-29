@@ -178,32 +178,40 @@ static void wp11_Stateful_WriteU64(byte* p, word64 v)
  * standard IV; same for every scheme. */
 #define WP11_STATEFUL_IV_LEN          12
 
-/* Cached env-var read once at first use: when 1, the state-write callback
- * skips fsync() (file and directory). DANGEROUS: documented as non-production
- * only. Default is to always fsync. The variable applies to ALL stateful
- * hash-based signature schemes (LMS/HSS today; XMSS in the future) - there
- * is no per-scheme knob, since the durability requirement is identical. */
-static int wp11_StatefulRelaxFsync = -1;
+/* When 1, the state-write callback skips fsync() of the file and its parent
+ * directory. DANGEROUS: documented as non-production only. Default is to
+ * always fsync. The setting applies to ALL stateful hash-based signature
+ * schemes (LMS/HSS today; XMSS in the future) - there is no per-scheme knob,
+ * since the durability requirement is identical.
+ *
+ * Resolved once from WP11_Stateful_InitRelaxFsync() during library init, not
+ * lazily on first use: signing threads on different slots hold different token
+ * locks, so a lazy initialiser here would be an unsynchronised write to this
+ * static, which ThreadSanitizer reports and which no lock in the sign path
+ * covers. */
+static int wp11_StatefulRelaxFsync = 0;
+
+void WP11_Stateful_InitRelaxFsync(void)
+{
+#ifndef WOLFPKCS11_NO_ENV
+    const char* v = XGETENV("WOLFPKCS11_STATEFUL_RELAX_FSYNC");
+    wp11_StatefulRelaxFsync = (v != NULL && v[0] == '1' && v[1] == '\0') ? 1 : 0;
+#else
+    wp11_StatefulRelaxFsync = 0;
+#endif
+    if (wp11_StatefulRelaxFsync) {
+        /* Single, prominent stderr line - the README documents this is
+         * non-production. Operators who reach this path must see it. */
+        fprintf(stderr,
+            "wolfPKCS11: WARNING: WOLFPKCS11_STATEFUL_RELAX_FSYNC=1 is "
+            "set. Stateful hash-signature state writes will skip fsync; "
+            "a power loss can roll back the leaf-index advance and cause "
+            "OTS-key REUSE. Do NOT use this setting in production.\n");
+    }
+}
 
 static int wp11_StatefulShouldFsync(void)
 {
-    if (wp11_StatefulRelaxFsync < 0) {
-#ifndef WOLFPKCS11_NO_ENV
-        const char* v = XGETENV("WOLFPKCS11_STATEFUL_RELAX_FSYNC");
-        wp11_StatefulRelaxFsync = (v != NULL && v[0] == '1' && v[1] == '\0') ? 1 : 0;
-#else
-        wp11_StatefulRelaxFsync = 0;
-#endif
-        if (wp11_StatefulRelaxFsync) {
-            /* Single, prominent stderr line - the README documents this is
-             * non-production. Operators who reach this path must see it. */
-            fprintf(stderr,
-                "wolfPKCS11: WARNING: WOLFPKCS11_STATEFUL_RELAX_FSYNC=1 is "
-                "set. Stateful hash-signature state writes will skip fsync; "
-                "a power loss can roll back the leaf-index advance and cause "
-                "OTS-key REUSE. Do NOT use this setting in production.\n");
-        }
-    }
     return wp11_StatefulRelaxFsync ? 0 : 1;
 }
 
@@ -292,16 +300,12 @@ static int wp11_Stateful_WriteStateBlob(WP11_Object* o,
         return ret;
     }
 
-    /* total bytes to write: hdr + ivLen u32 + iv + ctLen u32 + ct||tag -
-     * unused for file storage, but kept for parity with TPM_STORE. */
-    (void)(hdrLen + 4 + WP11_STATEFUL_IV_LEN + 4 + ctLen);
-
     tokenId = (int)o->slot->id;
     ret = wp11_Stateful_StateFile_Open(schemeFilePrefix, tokenId,
         o->statefulStateId, 0, &storage);
     if (ret == 0) {
         if (wp11_StatefulShouldFsync())
-            wolfPKCS11_Store_SetDurable(storage, 1);
+            wp11_storage_set_durable(storage, 1);
         ret = wp11_storage_write(storage, hdr, (int)hdrLen);
         if (ret == 0) {
             byte ivLenBuf[4];
@@ -321,7 +325,7 @@ static int wp11_Stateful_WriteStateBlob(WP11_Object* o,
          * a failed rename/fsync; that would let wolfSSL release a signature
          * whose state advance never reached durable storage. */
         {
-            int closeRet = wolfPKCS11_Store_CloseAndReport(storage);
+            int closeRet = wp11_storage_close_report(storage);
             if (ret == 0)
                 ret = closeRet;
         }
@@ -354,7 +358,7 @@ static int wp11_Stateful_ReadStateBlob(WP11_Object* o,
     word64 sigCount = 0;
     int tokenId;
 
-    if (o == NULL || priv == NULL || privSz == 0)
+    if (o == NULL || o->slot == NULL || priv == NULL || privSz == 0)
         return BAD_FUNC_ARG;
     if (o->statefulStateId == 0)
         return BAD_FUNC_ARG;

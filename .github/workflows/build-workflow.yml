@@ -12,6 +12,9 @@ on:
           type: string
           default: 'make check'
         wolfssl_lms:
+          # Callers passing --enable-lms-private in `config` must also set this
+          # to 'yes': wolfPKCS11 keygen and signing need a sign-capable wolfSSL
+          # LMS build, and its configure now fails outright on a verify-only one.
           required: false
           type: string
           default: 'verify-only'
