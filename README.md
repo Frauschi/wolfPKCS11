@@ -76,6 +76,94 @@ As ML-KEM is a feature of PKCS#11 version 3.2, support for that is required,
 too. Hence, to enable all in wolfPKCS11, add `--enable-pkcs11v32 --enable-mlkem`
 during the configure step.
 
+### Optional: LMS/HSS Hash-Based Signatures (RFC 8554)
+
+Verification and public-key import for LMS/HSS are enabled with `--enable-lms`
+(or `WOLFPKCS11_LMS=yes` in CMake) and require a wolfSSL build with LMS support
+(`--enable-lms`, `WOLFSSL_HAVE_LMS`). LMS/HSS is a feature of PKCS#11 version
+3.2, so that support is enabled automatically.
+
+Key generation and signing are **EXPERIMENTAL** and off by default. Enable them
+with `--enable-lms-private` (or `WOLFPKCS11_LMS_PRIVATE=yes` in CMake), which
+implies `--enable-lms` and requires a *sign-capable* wolfSSL LMS build (full
+`--enable-lms`, not `--enable-lms=verify-only`).
+
+LMS/HSS is a **stateful** signature scheme: every one-time-signature (OTS) leaf
+index must be used at most once, and reusing an index catastrophically breaks
+security. wolfPKCS11 therefore:
+
+* Requires stateful private keys to be token-resident (`CKA_TOKEN=TRUE`); a
+  session-only key that vanished on a crash could release a signature whose OTS
+  index was never persisted.
+* Durably persists the advanced key state (fsync plus atomic rename of an
+  encrypted, authenticated state file) *before* each signature is released, so a
+  crash or power loss cannot roll the OTS index backwards.
+
+Because the signature state is durable and per-key, do not clone, snapshot, or
+restore the token storage directory of a machine that signs with LMS/HSS keys -
+rolling the state files back to an earlier point would reuse OTS indices.
+
+#### Security model for stateful private keys
+
+Each HSS private key has a durable, per-key state file separate from the key
+object. Its layout is an AES-GCM ciphertext whose Additional Authenticated Data
+(AAD) binds the header magic, format version, scheme parameters (levels, LMS
+height, LMOTS Winternitz), and the running signature counter. A fresh random
+nonce is generated for every write. The private key material is encrypted with
+the token key (derived from the user PIN) and the decrypted buffers are cleared
+with `wc_ForceZero` on every path.
+
+What this **detects and refuses** (fail-closed):
+
+* In-place tampering or corruption of a state file - a flipped byte, a truncated
+  file, a wrong magic/version, or altered scheme parameters fails the AES-GCM
+  authentication (or the header check) at reload time, and the key will not
+  sign.
+* A signature-state write that does not become durable (fsync/rename failure) -
+  the key is poisoned in memory, the in-memory counter is reverted, and no
+  signature is released; a reload recovers to the last durable index and never
+  advances past the failed write.
+
+What this **cannot** protect against (inherent to any software-only stateful
+scheme - handle operationally):
+
+* **Offline state rollback.** Anyone who can copy the token directory and later
+  restore it - a filesystem backup/restore, a VM or container snapshot, `cp`,
+  or block-level replication - resets the OTS counter and causes one-time-key
+  **reuse**, which breaks the signatures irrecoverably. Only an HSM/TPM with a
+  hardware monotonic counter can prevent this, and that path is out of scope
+  here. Never restore or duplicate a signing machine's token directory.
+* **`WOLFPKCS11_STATEFUL_RELAX_FSYNC=1`.** An opt-in environment variable that
+  trades durability for speed when running tests on throwaway storage, at the
+  cost of the guarantee above: a crash or power loss can then leave the on-disk
+  state behind the signatures already released, reusing OTS keys. It is never
+  set by default; leave it unset in any real deployment. See
+  [WOLFPKCS11_STATEFUL_RELAX_FSYNC](#wolfpkcs11_stateful_relax_fsync).
+* **Concurrent use of one token directory from multiple processes.** State
+  durability and mutual exclusion are enforced within a single library instance;
+  two processes signing against the same on-disk token can reuse indices. Use
+  one signing process per token directory.
+
+HSS signing is not secret-input timing-sensitive the way an RSA/ECC private
+scalar is (the message and the tree position are not confidential), so no
+constant-time treatment beyond the existing token-key handling is required.
+
+#### Known limitation: a spent or damaged key is hidden, not reportable
+
+An HSS private key whose state cannot be reloaded - because the tree is
+exhausted, or because the state file was damaged - stays flagged as undecoded,
+which is how this library already treats any object it cannot decode for the
+current user. Such an object is skipped by `C_FindObjects`.
+
+The token itself keeps working: `C_Login` succeeds and every other object on it
+stays usable. But the spent key is not enumerable, so it cannot be handed to
+`C_DestroyObject`; its object and state files have to be removed from the token
+directory by hand.
+
+Reporting the key instead of hiding it means quarantining objects individually
+in the shared decode-at-login path, which affects every key type. That is
+planned as a separate change.
+
 ### Build options and defines
 
 #### Define WOLFPKCS11_TPM_STORE
@@ -267,6 +355,8 @@ cmake -DCMAKE_PREFIX_PATH=/path/to/wolfssl/install ..
 | `WOLFPKCS11_PKCS11_V3_2` | `no` | PKCS#11 v3.2 support |
 | `WOLFPKCS11_MLDSA` | `no` | ML-DSA support |
 | `WOLFPKCS11_MLKEM` | `no` | ML-KEM support |
+| `WOLFPKCS11_LMS` | `no` | LMS/HSS verification and public-key import |
+| `WOLFPKCS11_LMS_PRIVATE` | `no` | LMS/HSS keygen + signing (EXPERIMENTAL, stateful private keys) |
 | `WOLFPKCS11_EXAMPLES` | `yes` | Build examples |
 | `WOLFPKCS11_TESTS` | `yes` | Build and register tests |
 | `WOLFPKCS11_COVERAGE` | `no` | Code coverage support |
@@ -293,6 +383,15 @@ POSIX or `%APPDIR%\wolfPKCS11` on Windows), and finally the optional
 ### WOLFPKCS11_NO_STORE
 
 Set to any value to stop storage of token data.
+
+### WOLFPKCS11_STATEFUL_RELAX_FSYNC
+
+**Non-production only.** When set to `1`, wolfPKCS11 skips the `fsync()` calls
+(file and parent directory) that make LMS/HSS signature-state writes durable.
+This speeds up test runs on throwaway storage but is **dangerous**: after a
+crash or power loss the on-disk state can lag the signatures already released,
+leading to **OTS-key reuse**. Leave it unset (the default always fsyncs) in any
+real deployment. Only meaningful when built with `--enable-lms-private`.
 
 
 ## Release Notes

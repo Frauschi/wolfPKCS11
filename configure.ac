@@ -596,6 +596,64 @@ then
     AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_LMS"
 fi
 
+# LMS/HSS key generation and signing (EXPERIMENTAL). Stateful private keys:
+# a one-time signature leaf must never be reused, so signing durably persists
+# the advanced key state before releasing each signature. Implies --enable-lms
+# and requires a sign-capable wolfSSL LMS build (not --enable-lms=verify-only).
+AC_ARG_ENABLE([lms-private],
+    [AS_HELP_STRING([--enable-lms-private],[Enable LMS/HSS keygen and signing (EXPERIMENTAL, stateful private keys, default: disabled)])],
+    [ ENABLED_LMS_PRIVATE=$enableval ],
+    [ ENABLED_LMS_PRIVATE=no ]
+    )
+
+# LMS/HSS is SHA-256 based. Check the dependency BEFORE the --enable-lms
+# implication below so a missing SHA-256 disables lms-private without leaving
+# --enable-lms turned on for a broken build.
+if test "$ENABLED_SHA256" = "no" && test "$ENABLED_LMS_PRIVATE" = "yes"
+then
+    echo "LMS/HSS requires SHA-256 support (disabled), disabling LMS/HSS keygen+sign"
+    ENABLED_LMS_PRIVATE=no
+fi
+
+if test "$ENABLED_LMS_PRIVATE" = "yes" && test "$ENABLED_LMS" = "no"
+then
+    AC_MSG_NOTICE([--enable-lms-private implies --enable-lms; enabling])
+    ENABLED_LMS=yes
+    if test "$ENABLED_PKCS11V3_2" = "no"; then
+        ENABLED_PKCS11V3_2=yes
+        AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_2"
+        if test "$ENABLED_PKCS11V3_0" = "no"; then
+            ENABLED_PKCS11V3_0=yes
+            AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_0"
+        fi
+    fi
+    AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_LMS"
+fi
+
+# A verify-only wolfSSL LMS build has no wc_LmsKey_MakeKey/_Sign, which would
+# otherwise surface as a pile of errors deep in the compile of src/hbs.c. Catch
+# it here instead. WOLFSSL_LMS_VERIFY_ONLY is only visible when the installed
+# headers expose it, so probe the symbol rather than the macro.
+if test "$ENABLED_LMS_PRIVATE" = "yes"
+then
+    AC_MSG_CHECKING([for a sign-capable wolfSSL LMS build])
+    SAVED_LIBS="$LIBS"
+    LIBS="$LIBS -lwolfssl"
+    AC_LINK_IFELSE(
+        [AC_LANG_PROGRAM(
+            [[#include <wolfssl/options.h>
+              #include <wolfssl/wolfcrypt/random.h>
+              #include <wolfssl/wolfcrypt/wc_lms.h>]],
+            [[LmsKey* k = (LmsKey*)0; WC_RNG* r = (WC_RNG*)0;
+              return wc_LmsKey_MakeKey(k, r);]])],
+        [AC_MSG_RESULT([yes])],
+        [AC_MSG_RESULT([no])
+         AC_MSG_ERROR([--enable-lms-private needs a sign-capable wolfSSL LMS build; wolfSSL configured with --enable-lms=verify-only provides verification only. Rebuild wolfSSL with --enable-lms=yes.])])
+    LIBS="$SAVED_LIBS"
+
+    AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_LMS_PRIVATE"
+fi
+
 # XMSS/XMSS^MT (RFC 8391) verification and public-key import. Requires wolfSSL
 # built with --enable-xmss (WOLFSSL_HAVE_XMSS). Verify + public-key import only.
 AC_ARG_ENABLE([xmss],
@@ -815,6 +873,7 @@ echo "   * HKDF:                       $ENABLED_HKDF"
 echo "   * ML-DSA:                     $ENABLED_MLDSA"
 echo "   * ML-KEM:                     $ENABLED_MLKEM"
 echo "   * LMS/HSS verify:             $ENABLED_LMS"
+echo "   * LMS/HSS sign+keygen (EXP):  $ENABLED_LMS_PRIVATE"
 echo "   * XMSS/XMSS^MT verify:        $ENABLED_XMSS"
 echo "   * NSS modifications:          $ENABLED_NSS"
 echo "   * Default token path:         $WOLFPKCS11_DEFAULT_TOKEN_PATH"

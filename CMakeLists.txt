@@ -474,7 +474,7 @@ endif()
 
 if(WOLFPKCS11_MLDSA)
     if(NOT WOLFPKCS11_PKCS11_V3_2)
-        message(STATUS "ML-DSA requires PKCS#11 v3.2 support — enabling WOLFPKCS11_PKCS11_V3_2 automatically")
+        message(STATUS "ML-DSA requires PKCS#11 v3.2 support - enabling WOLFPKCS11_PKCS11_V3_2 automatically")
         override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
         if(NOT WOLFPKCS11_PKCS11_V3_0)
             override_cache(WOLFPKCS11_PKCS11_V3_0 "yes")
@@ -498,7 +498,7 @@ endif()
 
 if(WOLFPKCS11_MLKEM)
     if(NOT WOLFPKCS11_PKCS11_V3_2)
-        message(STATUS "ML-KEM requires PKCS#11 v3.2 support — enabling WOLFPKCS11_PKCS11_V3_2 automatically")
+        message(STATUS "ML-KEM requires PKCS#11 v3.2 support - enabling WOLFPKCS11_PKCS11_V3_2 automatically")
         override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
         if(NOT WOLFPKCS11_PKCS11_V3_0)
             override_cache(WOLFPKCS11_PKCS11_V3_0 "yes")
@@ -522,7 +522,7 @@ endif()
 
 if(WOLFPKCS11_LMS)
     if(NOT WOLFPKCS11_PKCS11_V3_2)
-        message(STATUS "LMS/HSS requires PKCS#11 v3.2 support — enabling WOLFPKCS11_PKCS11_V3_2 automatically")
+        message(STATUS "LMS/HSS requires PKCS#11 v3.2 support - enabling WOLFPKCS11_PKCS11_V3_2 automatically")
         override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
         if(NOT WOLFPKCS11_PKCS11_V3_0)
             override_cache(WOLFPKCS11_PKCS11_V3_0 "yes")
@@ -531,6 +531,38 @@ if(WOLFPKCS11_LMS)
         list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_PKCS11_V3_2")
     endif()
     list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_LMS")
+endif()
+
+# LMS/HSS keygen + signing (EXPERIMENTAL, stateful private keys; default: disabled)
+add_option("WOLFPKCS11_LMS_PRIVATE"
+    "Enable wolfPKCS11 LMS/HSS keygen and signing (EXPERIMENTAL, stateful private keys, default: disabled)"
+    "no" "yes;no"
+)
+
+# LMS/HSS is SHA-256 based. Check the dependency BEFORE the force-enable below
+# so a missing SHA-256 disables LMS_PRIVATE without leaving LMS enabled on its
+# own (the force-enable would otherwise turn LMS on for a broken build).
+if(WOLFPKCS11_LMS_PRIVATE AND NOT WOLFPKCS11_SHA256)
+    message(STATUS "LMS/HSS requires SHA-256 support (disabled); disabling WOLFPKCS11_LMS_PRIVATE")
+    override_cache(WOLFPKCS11_LMS_PRIVATE "no")
+endif()
+
+if(WOLFPKCS11_LMS_PRIVATE AND NOT WOLFPKCS11_LMS)
+    message(STATUS "WOLFPKCS11_LMS_PRIVATE requires WOLFPKCS11_LMS - enabling WOLFPKCS11_LMS automatically")
+    override_cache(WOLFPKCS11_LMS "yes")
+    if(NOT WOLFPKCS11_PKCS11_V3_2)
+        override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
+        if(NOT WOLFPKCS11_PKCS11_V3_0)
+            override_cache(WOLFPKCS11_PKCS11_V3_0 "yes")
+            list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_PKCS11_V3_0")
+        endif()
+        list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_PKCS11_V3_2")
+    endif()
+    list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_LMS")
+endif()
+
+if(WOLFPKCS11_LMS_PRIVATE)
+    list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_LMS_PRIVATE")
 endif()
 
 # XMSS/XMSS^MT (RFC 8391) verify + public-key import (default: disabled)
@@ -546,7 +578,7 @@ endif()
 
 if(WOLFPKCS11_XMSS)
     if(NOT WOLFPKCS11_PKCS11_V3_2)
-        message(STATUS "XMSS requires PKCS#11 v3.2 support — enabling WOLFPKCS11_PKCS11_V3_2 automatically")
+        message(STATUS "XMSS requires PKCS#11 v3.2 support - enabling WOLFPKCS11_PKCS11_V3_2 automatically")
         override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
         if(NOT WOLFPKCS11_PKCS11_V3_0)
             override_cache(WOLFPKCS11_PKCS11_V3_0 "yes")
@@ -599,6 +631,7 @@ set(LIB_SOURCES
     src/wolfpkcs11.c
     src/slot.c
     src/crypto.c
+    src/hbs.c
 )
 if(BUILD_SHARED_LIBS)
     message(STATUS "BUILD_SHARED_LIBS enabled: ${LIB_SOURCES}")
@@ -785,6 +818,26 @@ if(WOLFPKCS11_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/hbs_persistence_test.c)
         set_tests_properties(hbs_persistence_test PROPERTIES SKIP_RETURN_CODE 77)
     endif()
+
+    # LMS/HSS keygen and signing tests. Both exit 77 (skip) when the feature is
+    # compiled out, so they can be registered unconditionally like the test
+    # above and still behave in a verify-only build.
+    #
+    # Each gets its own token directory. They wipe the store between sub-tests
+    # to start from a known state, which would clobber the other tests running
+    # beside them under `ctest -j`.
+    add_wpkcs11_test(hbs_private_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hbs_private_test.c)
+    set_tests_properties(hbs_private_test PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT
+            "WOLFPKCS11_TOKEN_PATH=${CMAKE_CURRENT_BINARY_DIR}/store-hbs-private")
+    add_wpkcs11_test(hss_concurrency_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hss_concurrency_test.c)
+    set_tests_properties(hss_concurrency_test PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT
+            "WOLFPKCS11_TOKEN_PATH=${CMAKE_CURRENT_BINARY_DIR}/store-hss-concurrency")
 endif()
 
 if(WOLFPKCS11_EXAMPLES)

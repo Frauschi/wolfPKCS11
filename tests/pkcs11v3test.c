@@ -3046,8 +3046,25 @@ static CK_RV hbs_keygen_rejected(CK_SESSION_HANDLE session,
     mech.ulParameterLen = 0;
     ret = funcList->C_GenerateKeyPair(session, &mech, pubTmpl, 1,
         privTmpl, 1, &pub, &priv);
-    CHECK_CKR_FAIL(ret, CKR_MECHANISM_INVALID,
-        "HBS keygen rejected in verify-only build");
+#ifdef WOLFPKCS11_LMS_PRIVATE
+    if (kgMech == CKM_HSS_KEY_PAIR_GEN) {
+        /* Sign-capable build: HSS keygen is supported. This minimal template
+         * omits CKA_TOKEN (and the scheme attributes), so keygen rejects it as
+         * an inconsistent template, not an invalid mechanism. */
+        CHECK_CKR_FAIL(ret, CKR_TEMPLATE_INCONSISTENT,
+            "HSS keygen with incomplete template rejected");
+    }
+    else
+#endif
+    {
+        CHECK_CKR_FAIL(ret, CKR_MECHANISM_INVALID,
+            "HBS keygen rejected (no sign support for this scheme)");
+    }
+    /* Should not have produced objects, but clean up if a regression did. */
+    if (pub != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, pub);
+    if (priv != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, priv);
     return ret;
 }
 
@@ -3118,6 +3135,16 @@ static CK_RV hbs_mech_info(CK_MECHANISM_TYPE mechType)
         ret = CKR_GENERAL_ERROR;
         CHECK_CKR(ret, "HBS mech info missing CKF_VERIFY");
     }
+#ifdef WOLFPKCS11_LMS_PRIVATE
+    if (mechType == CKM_HSS) {
+        /* Sign-capable build: CKM_HSS advertises signing too. */
+        if (ret == CKR_OK && (info.flags & CKF_SIGN) == 0) {
+            ret = CKR_GENERAL_ERROR;
+            CHECK_CKR(ret, "HSS mech info missing CKF_SIGN (sign build)");
+        }
+    }
+    else
+#endif
     if (ret == CKR_OK && (info.flags & CKF_SIGN) != 0) {
         ret = CKR_GENERAL_ERROR;
         CHECK_CKR(ret, "HBS mech info unexpectedly claims CKF_SIGN");
@@ -3140,6 +3167,10 @@ static CK_RV hbs_empty_template_rejected(CK_SESSION_HANDLE session,
 
     ret = funcList->C_CreateObject(session, tmpl,
         sizeof(tmpl) / sizeof(*tmpl), &obj);
+    /* This holds in a sign-capable build too. C_GenerateKeyPair does create
+     * both objects from templates with no key material, but that is internal
+     * to keygen; C_CreateObject has no second step that would fill the value
+     * in, so an empty template is still an incomplete one. */
     CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
         "HBS empty-template public key rejected");
     if (obj != CK_INVALID_HANDLE)

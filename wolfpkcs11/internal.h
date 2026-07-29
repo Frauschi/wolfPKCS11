@@ -133,6 +133,30 @@ C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT"
 #error Compiling with XMSS requires XMSS support in wolfSSL (--enable-xmss).
 #endif
 
+#if defined(WOLFPKCS11_LMS_PRIVATE) && defined(WOLFSSL_LMS_VERIFY_ONLY)
+#error LMS/HSS keygen+sign (--enable-lms-private) needs a sign-capable wolfSSL LMS build, not verify-only.
+#endif
+#if defined(WOLFPKCS11_LMS_PRIVATE) && !defined(WOLFPKCS11_LMS)
+#error WOLFPKCS11_LMS_PRIVATE requires WOLFPKCS11_LMS.
+#endif
+#if defined(WOLFPKCS11_LMS_PRIVATE) && defined(WOLFPKCS11_NO_STORE)
+#error WOLFPKCS11_LMS_PRIVATE requires object storage for durable signature state (not WOLFPKCS11_NO_STORE).
+#endif
+#if defined(WOLFPKCS11_LMS_PRIVATE) && defined(WOLFPKCS11_TPM_STORE)
+#error WOLFPKCS11_LMS_PRIVATE is incompatible with WOLFPKCS11_TPM_STORE (encrypted state blobs exceed TPM NV capacity).
+#endif
+#if defined(WOLFPKCS11_LMS_PRIVATE) && defined(WOLFPKCS11_CUSTOM_STORE)
+#error WOLFPKCS11_LMS_PRIVATE is incompatible with WOLFPKCS11_CUSTOM_STORE (the durable signature-state file needs the built-in file store).
+#endif
+
+/* Stateful hash-based signature framework selector. _PRIVATE gates the
+ * encrypted durable-state infrastructure (keygen + signing); it is compiled
+ * only in sign-capable builds. Future XMSS private-key support reuses the same
+ * framework. */
+#if defined(WOLFPKCS11_LMS_PRIVATE)
+#define WOLFPKCS11_STATEFUL_SIG_PRIVATE
+#endif
+
 /* We need the next two for NSS, just for storage, even if we have no algos */
 #ifndef WC_MD5_DIGEST_SIZE
 #define WC_MD5_DIGEST_SIZE 16
@@ -246,6 +270,10 @@ C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT"
 #define WP11_FLAG_NOT_COPYABLE         0x00200000
 #define WP11_FLAG_NOT_DESTROYABLE      0x00400000
 #define WP11_FLAG_NOT_MODIFIABLE       0x00800000
+/* Set when a stateful private key's one-time-signature state is live and
+ * usable; cleared ("poisoned") on any keygen/sign/reload failure so a
+ * subsequent sign returns CKR_DEVICE_ERROR instead of risking OTS reuse. */
+#define WP11_FLAG_STATEFUL_STATE_VALID 0x01000000
 
 /* Flags for token. */
 #define WP11_TOKEN_FLAG_USER_PIN_SET   0x00000001
@@ -293,7 +321,7 @@ C_EXTRA_FLAGS="-DWOLFSSL_PUBLIC_MP -DWC_RSA_DIRECT"
 #define WP11_INIT_TLS_MAC_VERIFY       0x0071
 #define WP11_INIT_MLDSA_SIGN           0x0080
 #define WP11_INIT_MLDSA_VERIFY         0x0081
-#define WP11_INIT_HSS_SIGN             0x0090 /* Reserved for future use */
+#define WP11_INIT_HSS_SIGN             0x0090
 #define WP11_INIT_HSS_VERIFY           0x0091
 #define WP11_INIT_XMSS_SIGN            0x00A0 /* Reserved for future use */
 #define WP11_INIT_XMSS_VERIFY          0x00A1
@@ -615,6 +643,18 @@ WP11_LOCAL int WP11_Object_SetHssKey(WP11_Object* object, unsigned char** data,
 WP11_LOCAL int WP11_Hss_Verify(unsigned char* sig, word32 sigLen,
                                unsigned char* data, word32 dataLen, int* stat,
                                WP11_Object* pub);
+#ifdef WOLFPKCS11_LMS_PRIVATE
+WP11_LOCAL int WP11_Hss_GenerateKeyPair(WP11_Object* pub, WP11_Object* priv,
+                                        CK_ULONG levels, CK_LMS_TYPE lmsType,
+                                        CK_LMOTS_TYPE lmotsType,
+                                        WP11_Slot* slot);
+WP11_LOCAL int WP11_Hss_Sign(unsigned char* data, word32 dataLen,
+                             unsigned char* sig, word32* sigLen,
+                             WP11_Object* priv);
+WP11_LOCAL word32 WP11_Hss_SigLen(WP11_Object* key);
+WP11_LOCAL int WP11_Hss_SigsLeft(WP11_Object* key, word32* remaining);
+WP11_LOCAL void WP11_Hss_RemoveOrphanState(WP11_Object* priv, WP11_Slot* slot);
+#endif
 #endif
 
 #ifdef WOLFPKCS11_XMSS
