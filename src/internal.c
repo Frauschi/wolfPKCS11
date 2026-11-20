@@ -2587,9 +2587,10 @@ int wolfPKCS11_Store_OpenSz(int type, CK_ULONG id1, CK_ULONG id2, int read,
         }
 
         if (ret == 0 && read) {
+            errno = 0;
             ctx->file = XFOPEN(name, "rb");
             if (ctx->file == NULL) {
-                ret = NOT_AVAILABLE_E;
+                ret = (errno == ENOENT) ? NOT_AVAILABLE_E : READ_ONLY_E;
             }
         }
         else if (ret == 0) {
@@ -2893,6 +2894,13 @@ int wolfPKCS11_Store_Read(void* store, unsigned char* buffer, int len)
 #else
     if (ctx != NULL && ctx->file != XBADFILE && ctx->file != NULL) {
         ret = (int)XFREAD(buffer, 1, len, ctx->file);
+    #ifdef XFERROR
+        if (ret < len && XFERROR(ctx->file))
+            ret = READ_ONLY_E;
+    #else
+        if (ret < len && ferror(ctx->file))
+            ret = READ_ONLY_E;
+    #endif
     }
 #endif
     return ret;
